@@ -1095,16 +1095,19 @@ static char *interpret_move(const game_state *state, game_ui *ui,
 		sprintf(buf, "%c%d,%d,%d",
 			    (char)(ui->hpencil && n > 0 ? 'P' : 'R'), ui->hx, ui->hy, n);
 
-        if (!ui->hcursor) 
+        	if (!ui->hcursor) 
 			ui->hshow = false;
 	
-
 		return dupstr(buf);
-    }
+   	 }
 	
 	if(ui->hshow && (button == 'X' || button == 'x'))
 	{
 		sprintf(buf, "%c%d,%d", (char)('X'), ui->hx, ui->hy);
+		
+		if (!ui->hcursor) 
+			ui->hshow = false;
+		
 		return dupstr(buf);
 	}
 
