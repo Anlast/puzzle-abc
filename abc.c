@@ -749,22 +749,22 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 static char *new_game_desc(const game_params *params, random_state *rs,
 			   char **aux, int interactive)
 {
+	#ifdef STANDALON_SOLVER
+	int idcounter = 0;
+	#endif
 	int wh = params->wh;
 	int area = wh*wh;
 	int	desc_len = 4*params->wh;
 	int i, r, c;
-	
 	char *desc = snewn(desc_len, char);
 	byte *grid = NULL;
-	
+	struct solver_usage *usage = new_solver_usage(params);
 	struct edges edges;
 	edges.top = desc;
 	edges.bottom = edges.top + wh;
 	edges.left = edges.top + 2*wh;
 	edges.right = edges.top+ 3*wh;
 	
-	struct solver_usage *usage = new_solver_usage(params);
-	int idcounter = 0;
 	while(1)
 	{
 		idcounter++;
