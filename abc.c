@@ -486,9 +486,13 @@ static bool check_valid(byte *grid, const struct edges *edges, int wh)
 	/* Read the closest values to each edge */
  	for(r = 0; r < wh; r++)
 	{
-		for(c = i = 0; c < wh && i < 3; c++)
+		for(c = i = 0; c < wh; c++)
 		if(grid[r*wh+c] > 0)
-			vals[i++] = grid[r*wh+c];
+		{
+			if(i < 3)
+				vals[i] = grid[r*wh+c];
+			i++;
+		}
 		
 		if(i != 3)
 		{
@@ -502,9 +506,13 @@ static bool check_valid(byte *grid, const struct edges *edges, int wh)
 	
 	for(c = 0; c < wh; c++)
 	{
-		for(r = i = 0; r < wh && i < 3; r++)
+		for(r = i = 0; r < wh; r++)
 		if(grid[r*wh+c] > 0)
-			vals[i++] = grid[r*wh+c];
+		{
+			if(i < 3)
+				vals[i] = grid[r*wh+c];
+			i++;
+		}
 		
 		if(i != 3)
 		{
