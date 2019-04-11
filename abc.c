@@ -12,14 +12,8 @@
  * There also exists an interesting variation of this puzzle caleed 'Blood' which
  * can be found on Naoki Inaba's puzzles webpage
  *
- * TODO: - add printing functions
- *       - 'grid' and 'pencil' could be packed into a single byte (see struct cell)
- *
- * BUGS: - 'aux' in solve function doesn't display correct solution unless the same id is entered manually again 
- *         (using #if 0 to ignore this piece of code for now)
- *		 - 'game id' has some extra symbols when reducing the board size (this doesn't affect gameplay)
- *	     - when 'game id' has too few parameters correct error message is displayed initially 
- *         but then the wrong error message is displayed subsequently
+ * TODO: - fix draw_dges routine, can be made a lot prettier
+ *		 - add printing functions
  */
 
 #include <stdio.h>
@@ -42,10 +36,10 @@ int solver_show_working, solver_show_elimination;
 enum {
 	COL_BACKGROUND,
 	COL_GRID,
-	COL_LETTER,
+	COL_USER,
 	COL_HIGHLIGHT,
 	COL_PENCIL,
-	COL_XMARK,
+	COL_DONE,
 	COL_EDGE,
 	NCOLOURS
 };
@@ -58,11 +52,11 @@ struct edges {
 	byte *top, *bottom, *left, *right;
 };
 
-
+/* we could pack 'value' and 'pencil' into a single byte in game_state and _drawstate */
 #if 0 
-struct cell /* we could pack 'grid' and 'pencil' in game_state and _drawstate */
+struct cell
 {
-	unsigned int grid: 3;
+	unsigned int value: 3;
 	unsigned int pencil: 3;
 	unsigned int hl: 2;
 };
@@ -71,6 +65,7 @@ struct cell /* we could pack 'grid' and 'pencil' in game_state and _drawstate */
 struct game_state {
 	int wh;
 	struct edges edges;
+	bool *clues_completed;
 	byte *grid;
 	byte *pencil;
 	bool completed, cheated;
@@ -154,7 +149,8 @@ enum {
 	MASK_ABC = 0x07,
 	MASK_X = 0x08,
 	MASK_CURSOR = 0x10,
-	MASK_PENCIL = 0x20
+	MASK_PENCIL = 0x20,
+	MASK_CLUE_DONE = 0x40
 };
 
 struct solver_usage {
@@ -696,7 +692,8 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 	#endif
 	int wh = params->wh;
 	int area = params->wh*params->wh;
-	int	desc_len = 4*params->wh;
+	int	desc_len = 4*params->wh + 1;
+	int i;
 	char *desc = snewn(desc_len, char);
     struct solver_usage *usage = new_solver_usage(params);
 	struct edges edges;
@@ -704,6 +701,7 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 	edges.bottom = edges.top + wh;
 	edges.left = edges.top + 2*wh;
 	edges.right = edges.top + 3*wh;
+	desc[desc_len-1] = '\0';
 	
 	while(1)
 	{
@@ -720,19 +718,21 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 		memset(usage->col, MASK_ABC, wh);
 	}
 	
-	#if 0 /* BUG: solve doesn't display correctly but works after entering the same game id */
 	if (*aux)
 		sfree(*aux);
+	
 	*aux = snewn(area+2, char);
-	**aux = 'S';
+	(*aux)[0] = 'S';
 	memcpy((*aux)+1, usage->grid, area);
-	(*aux)[area+1] = '\0'; 
-	#endif 
+	for(i = 1; i <= wh*wh; i++)
+	if((*aux)[i] == 0)
+		(*aux)[i] = ' ';
+	
+	(*aux)[area+1] = '\0';
 	
 	free_solver_usage(usage);
 	{
-    int i;
-	for(i = 0; i < desc_len; i++)
+	for(i = 0; i < desc_len-1; i++)
 		desc[i] = (desc[i] >> 1) + 'A';
     }
 
@@ -749,12 +749,12 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 static char *new_game_desc(const game_params *params, random_state *rs,
 			   char **aux, int interactive)
 {
-	#ifdef STANDALON_SOLVER
+	#ifdef STANDALONE_SOLVER
 	int idcounter = 0;
 	#endif
 	int wh = params->wh;
 	int area = wh*wh;
-	int	desc_len = 4*params->wh;
+	int	desc_len = 4*params->wh + 1;
 	int i, r, c;
 	char *desc = snewn(desc_len, char);
 	byte *grid = NULL;
@@ -764,10 +764,13 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 	edges.bottom = edges.top + wh;
 	edges.left = edges.top + 2*wh;
 	edges.right = edges.top+ 3*wh;
+	desc[desc_len-1] = '\0';
 	
 	while(1)
 	{
+		#ifdef STANDALONE_SOLVER
 		idcounter++;
+		#endif
 
 		if(!grid)
 			sfree(grid);
@@ -828,20 +831,20 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 		memset(usage->col, MASK_ABC, params->wh);
 	}
 	
-	/* BUG: solve doesn't display correctly but works after entering the same game id */
-	#if 0
 	if (*aux)
 		sfree(*aux);
+	
 	*aux = snewn(area+2, char);
-	**aux = 'S';
+	(*aux)[0] = 'S';
 	memcpy((*aux)+1, usage->grid, area);
-	(*aux)[area+1] = '\0'; 
-	#endif 
+	for(i = 1; i <= wh*wh; i++)
+	if((*aux)[i] == 0)
+		(*aux)[i] = ' ';
 
 	free_solver_usage(usage);
 	
 	int i;
-	for(i = 0; i < desc_len; i++)
+	for(i = 0; i < desc_len - 1; i++)
 		desc[i] = (desc[i] >> 1) + 'A';
 	
 	return desc;
@@ -861,6 +864,23 @@ static const char *validate_desc(const game_params *params, const char *desc)
 	return NULL;
 }
 
+static key_label *game_request_keys(const game_params *params, int *nkeys)
+{
+    int i;
+    key_label *keys = snewn(3, key_label);
+    *nkeys = 3 + 1;
+
+    for (i = 0; i < 3; i++) {
+		keys[i].button = 'a' + i;
+        keys[i].label = NULL;
+    }
+	
+    keys[3].button = '\b';
+    keys[3].label = NULL;
+
+    return keys;
+}
+
 static game_state *new_game(midend *me, const game_params *params,
                             const char *desc)
 {
@@ -878,6 +898,9 @@ static game_state *new_game(midend *me, const game_params *params,
 	
 	for(i = 0; i < 4*wh; i++)
 	state->edges.top[i] = 1 << (desc[i] - 'A');
+
+	state->clues_completed = snewn(4*wh, bool);
+	memset(state->clues_completed, 0, 4*wh);
 	
 	state->grid = snewn(area, byte);
 	memset(state->grid, 0, area);
@@ -903,6 +926,8 @@ static game_state *dup_game(const game_state *state)
 	ret->edges.right = state->edges.top + 3*wh;
 	memcpy(ret->edges.top, state->edges.top, 4*wh);
 	
+	ret->clues_completed = snewn(4*wh, bool);
+	memcpy(ret->clues_completed, state->clues_completed, 4*wh);
 	ret->grid = snewn(area, byte);
 	memcpy(ret->grid, state->grid, area);
 	ret->pencil = snewn(area, byte);
@@ -917,6 +942,7 @@ static game_state *dup_game(const game_state *state)
 static void free_game(game_state *state)
 {
 	sfree(state->edges.top);
+	sfree(state->clues_completed);
 	sfree(state->grid);
 	sfree(state->pencil);
 	sfree(state);
@@ -927,6 +953,7 @@ static char *solve_game(const game_state *state, const game_state *currstate,
 {
 	char *ret;
 	int wh = state->wh;
+	int i ;
     game_params params; /* faking params for solver_usage */
     params.wh = wh;
 	
@@ -949,6 +976,10 @@ static char *solve_game(const game_state *state, const game_state *currstate,
 	}
 	
 	memcpy(ret+1, usage->grid, wh*wh);
+	
+	for(i = 1; i <= wh*wh; i++)
+	if(ret[i] == 0)
+		ret[i] = ' ';
 	
 	free_solver_usage(usage);
     }
@@ -1007,18 +1038,52 @@ static void game_changed_state(game_ui *ui, const game_state *oldstate,
 }
 
 #define PREFERRED_TILESIZE 48
-#define FLASH_TIME 0.2F
+#define FLASH_TIME 0.4F
 #define TILE_SIZE (ds->tilesize)
 #define BORDER (TILE_SIZE / 2)
 #define GRIDEXTRA max((TILE_SIZE / 32),1)
+#define CLUEPOS(x, y, index, w) do { \
+    if (index < w) \
+	x = index, y = -1; \
+    else if (index < 2*w) \
+	x = index-w, y = w; \
+    else if (index < 3*w) \
+	x = -1, y = index-2*w; \
+    else \
+	x = w, y = index-3*w; \
+} while (0)
 struct game_drawstate {
     bool started;
     int wh;
     int tilesize;
 	struct edges edges;
+	bool *clues_completed;
     byte *grid;
     byte *pencil;
 };
+
+static int clue_index(const game_state *state, int x, int y)
+{
+    int w = state->wh;
+
+    if (x == -1 || x == w)
+        return w * (x == -1 ? 2 : 3) + y;
+    else if (y == -1 || y == w)
+        return (y == -1 ? 0 : w) + x;
+
+    return -1;
+}
+
+static bool is_clue(const game_state *state, int x, int y)
+{
+    int w = state->wh;
+
+    if (((x == -1 || x == w) && y >= 0 && y < w) ||
+        ((y == -1 || y == w) && x >= 0 && x < w))
+            return true;
+
+    return false;
+}
 
 static char *interpret_move(const game_state *state, game_ui *ui,
                             const game_drawstate *ds,
@@ -1067,8 +1132,13 @@ static char *interpret_move(const game_state *state, game_ui *ui,
             ui->hcursor = false;
             return UI_UPDATE;
         }
+    } else if (button == LEFT_BUTTON) {
+        if (is_clue(state, tx, ty)) {
+            sprintf(buf, "%c%d,%d", 'D', tx, ty);
+            return dupstr(buf);
+       }
     }
-    
+			
 	if (IS_CURSOR_MOVE(button)) {
         move_cursor(button, &ui->hx, &ui->hy, wh, wh, 0);
         ui->hshow = ui->hcursor = true;
@@ -1131,17 +1201,32 @@ static game_state *execute_move(const game_state *from, const char *move)
 {
     int wh = from->wh;
     game_state *ret;
-    int x, y, n;
+    int x, y, n, i;
 
     if (move[0] == 'S') {
-		const char *p;
-		
 		ret = dup_game(from);
 		ret->completed = ret->cheated = true;
 		
-		p = move+1;
-	
-		memcpy(ret->grid, p, wh*wh);
+		for(i = 1; i < wh*wh+1; i++)
+		if((move[i] & ~MASK_ABC) && move[i] != ' ')
+		{
+			free_game(ret);
+			return NULL;
+		}
+		
+		if(move[wh*wh+1] != '\0')
+		{
+			free_game(ret);
+			return NULL;
+		}
+		
+		memcpy(ret->grid, move+1, wh*wh);
+		
+		for(i = 0; i < wh*wh; i++)
+		if(ret->grid[i] == ' ')
+				ret->grid[i] = 0;
+			
+		memset(ret->pencil, 0, wh*wh);
 
 		return ret;
     } else if ((move[0] == 'P' || move[0] == 'R') &&
@@ -1164,7 +1249,6 @@ static game_state *execute_move(const game_state *from, const char *move)
 		ret = dup_game(from);
 		ret->grid[y*wh+x] = 0;
 		ret->pencil[y*wh+x] = 8;
-		
 		return ret;
 	} else if(move[0] == 'M') {
         int i;
@@ -1174,8 +1258,14 @@ static game_state *execute_move(const game_state *from, const char *move)
 			ret->pencil[i] = MASK_ABC;
 		
 		return ret;
-	}
-		
+	} else if (move[0] == 'D' && sscanf(move+1, "%d,%d", &x, &y) == 2 &&
+               is_clue(from, x, y)) {
+        int index = clue_index(from, x, y);
+		ret = dup_game(from);
+        ret->clues_completed[index] = !ret->clues_completed[index];
+        return ret;
+    }
+	
 	return NULL;
 }
 
@@ -1208,9 +1298,9 @@ static float *game_colours(frontend *fe, int *ncolours)
     ret[COL_GRID * 3 + 1] = 0.0F;
     ret[COL_GRID * 3 + 2] = 0.0F;
 
-    ret[COL_LETTER * 3 + 0] = 0.0F;
-    ret[COL_LETTER * 3 + 1] = 0.0F;
-    ret[COL_LETTER * 3 + 2] = 0.0F;
+    ret[COL_USER * 3 + 0] = 0.0F;
+    ret[COL_USER * 3 + 1] = 0.6F * ret[COL_BACKGROUND * 3 + 1];
+    ret[COL_USER * 3 + 2] = 0.0F;
 
     ret[COL_HIGHLIGHT * 3 + 0] = 0.78F * ret[COL_BACKGROUND * 3 + 0];
     ret[COL_HIGHLIGHT * 3 + 1] = 0.78F * ret[COL_BACKGROUND * 3 + 1];
@@ -1220,9 +1310,9 @@ static float *game_colours(frontend *fe, int *ncolours)
     ret[COL_PENCIL * 3 + 1] = 0.5F * ret[COL_BACKGROUND * 3 + 1];
     ret[COL_PENCIL * 3 + 2] = ret[COL_BACKGROUND * 3 + 2];
 	
-	ret[COL_XMARK * 3 + 0] = 0.5F;
-	ret[COL_XMARK * 3 + 1] = 0.5F;
-	ret[COL_XMARK * 3 + 2] = 0.5F;
+    ret[COL_DONE * 3 + 0] = ret[COL_BACKGROUND * 3 + 0] / 1.5F;
+    ret[COL_DONE * 3 + 1] = ret[COL_BACKGROUND * 3 + 1] / 1.5F;
+    ret[COL_DONE * 3 + 2] = ret[COL_BACKGROUND * 3 + 2] / 1.5F;
 
     *ncolours = NCOLOURS;
     return ret;
@@ -1246,6 +1336,8 @@ static game_drawstate *game_new_drawstate(drawing *dr, const game_state *state)
 	ds->edges.left = ds->edges.top + 2*wh;
 	ds->edges.right = ds->edges.top + 3*wh;
 	memset(ds->edges.top, 0, 4*wh);
+	ds->clues_completed = snewn(4*wh, bool);
+	memset(ds->clues_completed, 0, 4*wh);
 	
     return ds;
 }
@@ -1255,6 +1347,7 @@ static void game_free_drawstate(drawing *dr, game_drawstate *ds)
     sfree(ds->grid);
 	sfree(ds->pencil);
 	sfree(ds->edges.top);
+	sfree(ds->clues_completed);
     sfree(ds);
 }
 
@@ -1273,14 +1366,14 @@ static void draw_edges(drawing *dr, game_drawstate *ds,
 	{
 		tx = BORDER + (i+1)*TILE_SIZE + 1;
 		
-		/* Top */
+		/* Top */		
 		ty = BORDER - GRIDEXTRA + 1;
 		clip(dr, tx, ty, tw, th);
 		draw_rect(dr, tx, ty, tw, th, COL_EDGE);
 		str[0] = (state->edges.top[i] >> 1) + 'A';
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  COL_LETTER, str);
+		  (state->clues_completed[i]) ? COL_DONE : COL_GRID, str);
 		unclip(dr);
 		
 		/* Bottom */
@@ -1291,7 +1384,7 @@ static void draw_edges(drawing *dr, game_drawstate *ds,
 
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  COL_LETTER, str);
+		  (state->clues_completed[wh+i]) ? COL_DONE : COL_GRID, str);
 		unclip(dr);
 
 		ty = BORDER + (i+1)*TILE_SIZE + 1;
@@ -1302,7 +1395,7 @@ static void draw_edges(drawing *dr, game_drawstate *ds,
 		str[0] = (state->edges.left[i] >> 1) + 'A';
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  COL_LETTER, str);
+		  (state->clues_completed[2*wh+i]) ? COL_DONE : COL_GRID, str);
 		unclip(dr);
 		
 		/* Right */
@@ -1312,7 +1405,7 @@ static void draw_edges(drawing *dr, game_drawstate *ds,
 		str[0] = (state->edges.right[i] >> 1) + 'A';
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  COL_LETTER, str);
+		  (state->clues_completed[3*wh+i]) ? COL_DONE : COL_GRID, str);
 		unclip(dr);
 	}
 }
@@ -1351,11 +1444,11 @@ static void draw_user_letter(drawing *dr, game_drawstate *ds,
 		str[0] = (state->grid[y*wh+x] >> 1) + 'A';
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_VCENTRE | ALIGN_HCENTRE,
-		  COL_LETTER, str);
+		  COL_USER, str);
     } else if(state->pencil[y*wh+x] & MASK_X) {
 			draw_text(dr, tx + tw/2, ty + th/2,
 				FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_VCENTRE | ALIGN_HCENTRE,
-				COL_XMARK, "X");
+				COL_DONE, "X");
 	} else {
 		byte npencil = 0;
 		byte pencil = state->pencil[y*wh+x];
@@ -1384,7 +1477,8 @@ static void game_redraw(drawing *dr, game_drawstate *ds,
                         float animtime, float flashtime)
 {
     int wh = state->wh;
-    int x, y;
+    int x, y, i;
+	bool redraw_edges = false;
 
     if (!ds->started) {
 		draw_rect(dr, 0, 0, TILE_SIZE*(wh+3), TILE_SIZE*(wh+3), COL_BACKGROUND);
@@ -1404,6 +1498,21 @@ static void game_redraw(drawing *dr, game_drawstate *ds,
                     TILE_SIZE * (wh+3), TILE_SIZE * (wh+3));
 		
 		ds->started = true;
+	}
+	
+	/* TODO: This can be programmed much nicely */
+	for(i = 0; i < 4*wh; i++) {
+		if(ds->clues_completed[i] != state->clues_completed[i])
+		{
+			ds->clues_completed[i] = state->clues_completed[i];
+			redraw_edges = true;
+		}
+	}
+	
+	if(redraw_edges) {
+	draw_edges(dr, ds, state);
+	draw_update(dr, 0, 0,
+          TILE_SIZE * (wh+3), TILE_SIZE * (wh+3));
 	}
 	
     for (x = 0; x < wh; x++) {
@@ -1490,7 +1599,7 @@ const struct game thegame = {
     free_ui,
     encode_ui,
     decode_ui,
-    NULL, /* game_request_keys */
+    game_request_keys,
     game_changed_state,
     interpret_move,
     execute_move,
