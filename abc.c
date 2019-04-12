@@ -2,18 +2,17 @@
  * abc.c - an implementation of Tetsuya Nishio's & Naoki Inaba's 'ABC' puzzle
  *
  * Currently there is two function versions for generating game id:
- * 1st func generates random edges, does some 're-arranging' and checks for unique solution
- * 2nd func generates a board with _AT LEAST one solution and checks for uniqueness
+ * 1st func generates random edges, does some 're-arranging' and checks for unique solution (brute force)
+ * 2nd func generates a board with _at least_ one solution (using a latin square) and checks for uniqueness
  * 
- * I had expected 2nd func to work bettter but it is only faster for small grids and then gets much slower
+ * I had expected 2nd func to work bettter but it is only faster for small grids and then gets much slower.
  * 
  * Unforunatelly both versions get too slow for grid sizes above 12
+ * It should be possible to generate larger grid sizes by using the 2nd func and adding some 
+ * immutables cells on the grid (the same way as 'Towers' does). I haven't got to trying this yet.
  *
- * There also exists an interesting variation of this puzzle caleed 'Blood' which
- * can be found on Naoki Inaba's puzzles webpage
- *
- * TODO: - fix draw_dges routine, can be made a lot prettier
- *		 - add printing functions
+ * There also exists an interesting variation of this puzzle called 'Blood group' which
+ * can be also found on Naoki Inaba's puzzles webpage.
  */
 
 #include <stdio.h>
@@ -51,16 +50,6 @@ struct game_params {
 struct edges {
 	byte *top, *bottom, *left, *right;
 };
-
-/* we could pack 'value' and 'pencil' into a single byte in game_state and _drawstate */
-#if 0 
-struct cell
-{
-	unsigned int value: 3;
-	unsigned int pencil: 3;
-	unsigned int hl: 2;
-};
-#endif
 
 struct game_state {
 	int wh;
@@ -114,7 +103,7 @@ static config_item *game_configure(const game_params *params)
 	
 	ret = snewn(2, config_item);
 	
-	ret[0].name = "Square size";
+	ret[0].name = "Grid size";
     ret[0].type = C_STRING;
     sprintf(buf, "%d", params->wh);
     ret[0].u.string.sval = dupstr(buf);
@@ -137,7 +126,7 @@ static game_params *custom_params(const config_item *cfg)
 static const char *validate_params(const game_params *params, bool full)
 {
     if (params->wh < 4)
-		return "Square size must be at least 4.";
+		return "Grid size must be at least 4.";
 
 	return NULL; 
 }
@@ -829,7 +818,9 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 		
 		if(solver(usage, &edges))
 		{
+			#ifdef STANDALONE_SOLVER
 			printf("idcounter:%d\n", idcounter);
+			#endif
 			break;	/* the solution is unique */
 		}
 		
@@ -851,7 +842,6 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 
 	free_solver_usage(usage);
 	
-	int i;
 	for(i = 0; i < desc_len - 1; i++)
 		desc[i] = (desc[i] >> 1) + 'A';
 	
@@ -1359,62 +1349,66 @@ static void game_free_drawstate(drawing *dr, game_drawstate *ds)
     sfree(ds);
 }
 
-static void draw_edges(drawing *dr, game_drawstate *ds,
-                        const game_state *state)
+static void draw_clue_letter(drawing *dr, game_drawstate *ds,
+                        const game_state *state, int x, int y)
 {
 	int wh = state->wh;
     int tx, ty, tw, th;
     char str[2];
-    int i;
 	
     tw = th = TILE_SIZE-1;
 	str[1] = '\0';
 	
-    for(i = 0; i<wh; i++)
+ 
+	if(y == -1 || y == wh)
 	{
-		tx = BORDER + (i+1)*TILE_SIZE + 1;
+		tx = BORDER + (x+1)*TILE_SIZE + 1;
 		
-		/* Top */		
+		if(y == -1) { /* Top */		
 		ty = BORDER - GRIDEXTRA + 1;
 		clip(dr, tx, ty, tw, th);
 		draw_rect(dr, tx, ty, tw, th, COL_EDGE);
-		str[0] = (state->edges.top[i] >> 1) + 'A';
+		str[0] = (state->edges.top[x] >> 1) + 'A';
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  (state->clues_completed[i]) ? COL_DONE : COL_GRID, str);
+		  (state->clues_completed[x]) ? COL_DONE : COL_GRID, str);
 		unclip(dr);
-		
-		/* Bottom */
+		} else if(y == wh) {/* Bottom */
 		ty = BORDER + (wh+1)*TILE_SIZE + GRIDEXTRA + 1;
 		clip(dr, tx, ty, tw, th);
 		draw_rect(dr, tx, ty, tw, th, COL_EDGE);
-		str[0] = (state->edges.bottom[i] >> 1) + 'A';
+		str[0] = (state->edges.bottom[x] >> 1) + 'A';
 
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  (state->clues_completed[wh+i]) ? COL_DONE : COL_GRID, str);
+		  (state->clues_completed[wh+x]) ? COL_DONE : COL_GRID, str);
 		unclip(dr);
+		}
+	}
 
-		ty = BORDER + (i+1)*TILE_SIZE + 1;
-		/* Left */
+	else if(x == -1 || x == wh)
+	{
+		ty = BORDER + (y+1)*TILE_SIZE + 1;
+		
+		if(x == -1) {/* Left */
 		tx = BORDER - GRIDEXTRA +1 ;
 		clip(dr, tx, ty, tw, th);
 		draw_rect(dr, tx, ty, tw, th, COL_EDGE);
-		str[0] = (state->edges.left[i] >> 1) + 'A';
+		str[0] = (state->edges.left[y] >> 1) + 'A';
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  (state->clues_completed[2*wh+i]) ? COL_DONE : COL_GRID, str);
+		  (state->clues_completed[2*wh+y]) ? COL_DONE : COL_GRID, str);
 		unclip(dr);
-		
-		/* Right */
+		} else if(x == wh) {/* Right */
 		tx = BORDER + (wh+1)*TILE_SIZE + GRIDEXTRA + 1;
 		clip(dr, tx, ty, tw, th);
 		draw_rect(dr, tx, ty, tw, th, COL_EDGE);
-		str[0] = (state->edges.right[i] >> 1) + 'A';
+		str[0] = (state->edges.right[y] >> 1) + 'A';
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  (state->clues_completed[3*wh+i]) ? COL_DONE : COL_GRID, str);
+		  (state->clues_completed[3*wh+y]) ? COL_DONE : COL_GRID, str);
 		unclip(dr);
+		}
 	}
 }
 
@@ -1475,8 +1469,6 @@ static void draw_user_letter(drawing *dr, game_drawstate *ds,
     }
 	
     unclip(dr);
-
-    draw_update(dr, tx, ty, tw, th);
 }
 
 static void game_redraw(drawing *dr, game_drawstate *ds,
@@ -1486,7 +1478,6 @@ static void game_redraw(drawing *dr, game_drawstate *ds,
 {
     int wh = state->wh;
     int x, y, i;
-	bool redraw_edges = false;
 
     if (!ds->started) {
 		draw_rect(dr, 0, 0, TILE_SIZE*(wh+3), TILE_SIZE*(wh+3), COL_BACKGROUND);
@@ -1499,28 +1490,19 @@ static void game_redraw(drawing *dr, game_drawstate *ds,
 		draw_rect(dr, BORDER-2*GRIDEXTRA, BORDER+GRIDEXTRA+TILE_SIZE*(wh+1)+1, TILE_SIZE+GRIDEXTRA, TILE_SIZE+GRIDEXTRA, COL_BACKGROUND);
 		draw_rect(dr, BORDER+GRIDEXTRA+TILE_SIZE*(wh+1)+1, BORDER-2*GRIDEXTRA, TILE_SIZE+GRIDEXTRA, TILE_SIZE+GRIDEXTRA, COL_BACKGROUND);
 		draw_rect(dr, BORDER+GRIDEXTRA+TILE_SIZE*(wh+1)+1, BORDER+GRIDEXTRA+TILE_SIZE*(wh+1)+1, TILE_SIZE+GRIDEXTRA, TILE_SIZE+GRIDEXTRA, COL_BACKGROUND);
-			
-		draw_edges(dr, ds, state);
-		  
-		draw_update(dr, 0, 0,
-                    TILE_SIZE * (wh+3), TILE_SIZE * (wh+3));
 		
 		ds->started = true;
 	}
 	
-	/* TODO: This can be programmed much nicely */
 	for(i = 0; i < 4*wh; i++) {
-		if(ds->clues_completed[i] != state->clues_completed[i])
-		{
-			ds->clues_completed[i] = state->clues_completed[i];
-			redraw_edges = true;
-		}
-	}
-	
-	if(redraw_edges) {
-	draw_edges(dr, ds, state);
-	draw_update(dr, 0, 0,
-          TILE_SIZE * (wh+3), TILE_SIZE * (wh+3));
+		if(ds->edges.top[i] == state->edges.top[i] &&
+			ds->clues_completed[i] == state->clues_completed[i])
+		continue;
+		
+		ds->edges.top[i] = state->edges.top[i];
+		ds->clues_completed[i] = state->clues_completed[i];
+		CLUEPOS(x, y, i, wh);
+		draw_clue_letter(dr, ds, state, x, y);
 	}
 	
     for (x = 0; x < wh; x++) {
@@ -1545,6 +1527,9 @@ static void game_redraw(drawing *dr, game_drawstate *ds,
 		draw_user_letter(dr, ds, state, x, y);
 	}
 	}
+	
+	draw_update(dr, 0, 0,
+                TILE_SIZE * (wh+3), TILE_SIZE * (wh+3));
 }
 
 static float game_anim_length(const game_state *oldstate,
