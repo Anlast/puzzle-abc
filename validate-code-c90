@@ -1,0 +1,1 @@
+https://gcc.godbolt.org/ -x c -std=c90 -pedantic -Wall
