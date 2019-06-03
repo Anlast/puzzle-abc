@@ -1,42 +1,70 @@
 /*
  * abc.c - an implementation of Tetsuya Nishio's & Naoki Inaba's 'ABC' puzzle
- *
- * Currently there is two function versions for generating game id:
- * 1st func generates random edges, does some 're-arranging' and checks for unique solution (brute force)
- * 2nd func generates a board with _at least_ one solution (using a latin square) and checks for uniqueness
  * 
- * I had expected 2nd func to work bettter but it is only faster for small grids and then gets much slower.
- * 
- * Unforunatelly both versions get too slow for grid sizes above 12
- * It should be possible to generate larger grid sizes by using the 2nd func and adding some 
- * immutables cells on the grid (the same way as 'Towers' does). I haven't got to trying this yet.
+ * The puzzle fails to generate grids of grid size bigger than 5 and letter count equivalent to the grid size (i.e. grid 6x6 with count 6)
  *
- * There also exists an interesting variation of this puzzle called 'Blood group' which
+ * There also exists a similar puzzle called 'Blood group' which
  * can be also found on Naoki Inaba's puzzles webpage.
+ * 
+ * TODO:
+ * - far_pos elim is wrong: the counting of val_other is incorrect!
+ * - solver forcing as in latin.c (adapted for empty cells)
+ * - see fix in STANDALONE_SOLVER
+ * - add immutable squares
+ * - finish DF_CLUE_DONE in drawing routine
+ * - improve the solver so that it can actually solve all the puzzles from the web 
+ *	 (perhaps add more difficulty levels with this 
+ *	  and difficulty grading in the standalone solver)
+ * - add printing routines
+ * - error checking to highlight wrong input on obvious cells(i.e. edge neigbour)
+ *
+ * BUGS:
+ * - tricky difficulty not working correctly with immutable squares
+ * - new_game_desc doesn't generate games with immutable squares
+ * - dup_game doesn't work properly with blank clues (maybe due to blanks stored as '\0's?)
+ * - letter F not shown in the solution on A-F
+ * - holding 'N'(new game) throws assertion abc.c line 879
  */
-
+  
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 #include <ctype.h>
 #include <stdbool.h>
+#include <math.h> /* FIX: just for (char)log2 */
 
 #include "puzzles.h"
+#include "latin.h"
 
 typedef unsigned char byte;
 
 #ifdef STANDALONE_SOLVER
-int solver_show_working, solver_show_elimination;
+int solver_show_working, verbose;
 #endif
 
-#define NEW_GAME_DESC_VERSION_1
+/*
+ * Difficulty levels. I do some macro ickery here to ensure that my
+ * enum and the various forms of my name list always match up.
+ */
+#define DIFFLIST(A) \
+    A(EASY,Easy,e) \
+    A(TRICKY,Tricky,t)
+#define ENUM(upper,title,lower) DIFF_ ## upper,
+#define TITLE(upper,title,lower) #title,
+#define ENCODE(upper,title,lower) #lower
+#define CONFIG(upper,title,lower) ":" #title
+enum { DIFFLIST(ENUM) DIFFCOUNT };
+static char const *const abc_diffnames[] = { DIFFLIST(TITLE) };
+static char const abc_diffchars[] = DIFFLIST(ENCODE);
+#define DIFFCONFIG DIFFLIST(CONFIG)
 
 enum {
 	COL_BACKGROUND,
 	COL_GRID,
 	COL_USER,
 	COL_HIGHLIGHT,
+	COL_ERROR,
 	COL_PENCIL,
 	COL_DONE,
 	COL_EDGE,
@@ -44,7 +72,7 @@ enum {
 };
 
 struct game_params {
-	int wh;
+	int wh, max, diff;
 };
 
 struct edges {
@@ -52,11 +80,12 @@ struct edges {
 };
 
 struct game_state {
-	int wh;
+	game_params par;
 	struct edges edges;
 	bool *clues_completed;
 	byte *grid;
 	byte *pencil;
+	bool *immutable;
 	bool completed, cheated;
 };
 
@@ -64,12 +93,41 @@ static game_params *default_params(void)
 {
 	game_params *ret = snew(game_params);
 	ret->wh = 5;
+	ret->max = 3;
+	ret->diff = DIFF_EASY;
 	return ret;
 }
 
+static const struct game_params abc_presets[] = {
+    {  4, 3, DIFF_EASY	   },
+    {  4, 3, DIFF_TRICKY   },
+    {  4, 4, DIFF_TRICKY     },
+    {  5, 3, DIFF_EASY   },
+    {  5, 3, DIFF_TRICKY     },
+    {  5, 4, DIFF_TRICKY   },
+    {  5, 5, DIFF_TRICKY 	   },
+	{  6, 3, DIFF_TRICKY   },
+	{  6, 4, DIFF_TRICKY   },
+	{  6, 5, DIFF_TRICKY   },
+	{  6, 6, DIFF_TRICKY   },
+};
+
 static bool game_fetch_preset(int i, char **name, game_params **params)
 {
-    return false;
+    game_params *ret;
+    char buf[80];
+
+    if (i < 0 || i >= lenof(abc_presets))
+        return false;
+
+    ret = snew(game_params);
+    *ret = abc_presets[i]; /* structure copy */
+
+    sprintf(buf, "%dx%d A-%c %s", ret->wh, ret->wh, 'A'+(ret->max-1), abc_diffnames[ret->diff]);
+
+    *name = dupstr(buf);
+    *params = ret;
+    return true;
 }
 
 static void free_params(game_params *params)
@@ -86,30 +144,63 @@ static game_params *dup_params(const game_params *params)
 
 static void decode_params(game_params *params, char const *string)
 {
-	params->wh = atoi(string);
+    char const *p = string;
+
+    params->wh = atoi(p);
+    while (*p && isdigit((unsigned char)*p)) p++;
+
+	if (*p == 'c')
+	params->max = atoi(++p);
+
+    if (*p == 'd') {
+        int i;
+        p++;
+        params->diff = DIFFCOUNT+1; /* ...which is invalid */
+        if (*p) {
+            for (i = 0; i < DIFFCOUNT; i++) {
+                if (*p == abc_diffchars[i])
+                    params->diff = i;
+            }
+            p++;
+        }
+    }
 }
 
 static char *encode_params(const game_params *params, bool full)
 {
-    char str[4];
-	sprintf(str, "%d", params->wh);
-    return dupstr(str);
+    char ret[80];
+
+    sprintf(ret, "%dc%d", params->wh, params->max);
+    if (full)
+        sprintf(ret + strlen(ret), "d%c", abc_diffchars[params->diff]);
+
+    return dupstr(ret);
 }
 
 static config_item *game_configure(const game_params *params)
 {
 	config_item *ret;
-	char buf[8];
+	char buf[80];
 	
-	ret = snewn(2, config_item);
+	ret = snewn(4, config_item);
 	
 	ret[0].name = "Grid size";
     ret[0].type = C_STRING;
     sprintf(buf, "%d", params->wh);
     ret[0].u.string.sval = dupstr(buf);
 	
-	ret[1].name = NULL;
-    ret[1].type = C_END;
+    ret[1].name = "Letter count"; /* FIX: */
+    ret[1].type = C_STRING;
+    sprintf(buf, "%d", params->max);
+    ret[1].u.string.sval = dupstr(buf);
+	
+	ret[2].name = "Difficulty";
+    ret[2].type = C_CHOICES;
+    ret[2].u.choices.choicenames = DIFFCONFIG;
+    ret[2].u.choices.selected = params->diff;
+	
+	ret[3].name = NULL;
+    ret[3].type = C_END;
 	
 	return ret;
 }
@@ -119,54 +210,64 @@ static game_params *custom_params(const config_item *cfg)
     game_params *ret = snew(game_params);
 
     ret->wh = atoi(cfg[0].u.string.sval);
+	ret->max = atoi(cfg[1].u.string.sval);
+	ret->diff = cfg[2].u.choices.selected;
 
     return ret;
 }
 
 static const char *validate_params(const game_params *params, bool full)
 {
-    if (params->wh < 4)
-		return "Grid size must be at least 4.";
-
+    if (params->wh < 3)
+		return "Grid size must be at least 3.";
+	if(params->max < 2 || params->max > params->wh)
+		return "Letter count must be between 2 and the grid size.";
+	if (params->diff >= DIFFCOUNT)
+        return "Unknown difficulty rating";
+	
 	return NULL; 
 }
+
+ /* ----------------------------------------------------------------------
+ * Solver.
+ */
  
 enum {
-	MASK_A = 0x01, 
-	MASK_B = 0x02, 
-	MASK_C = 0x04, 
-	MASK_ABC = 0x07,
-	MASK_X = 0x08,
-	MASK_CURSOR = 0x10,
-	MASK_PENCIL = 0x20,
-	MASK_CLUE_DONE = 0x40
+	MASK_X = 0x10,
+	MASK_CURSOR = 0x20,
+	MASK_PENCIL = 0x40,
+	MASK_CLUE_DONE = 0x80
 };
 
 struct solver_usage {
-	int wh, area;
+	game_params par;
 	/* Final deductions */
 	byte *grid;
-	/* Keeping track of possibilities for each cell (1 bit for each A, B or C) */
+	/* Keeping track of possibilities for each cell, bitmaps using bits 1<<1..1<<n */
 	byte *values;
 	/* Values still left to be allocated in each row and column */
     byte *row, *col;
+	/* Switch on every bit */
+	byte all;
+	int area;
 };
 
 static struct solver_usage *new_solver_usage(const game_params *params) 
 {	
 	struct solver_usage *ret = snew(struct solver_usage);
-	
-	ret->wh = params->wh;
-	ret->area = ret->wh*ret->wh;
+	ret->par = *params;
+	ret->area = ret->par.wh*ret->par.wh;
+	ret->par.max = params->max;
 	ret->grid = snewn(ret->area, byte);
 	ret->values = snewn(ret->area, byte);
-	ret->row = snewn(ret->wh, byte);
-	ret->col = snewn(ret->wh, byte);
+	ret->row = snewn(ret->par.wh, byte);
+	ret->col = snewn(ret->par.wh, byte);
+	ret->all = (1 << ret->par.max)-1;
 	
 	memset(ret->grid, 0, ret->area);
-	memset(ret->values, MASK_ABC, ret->area);
-	memset(ret->row, MASK_ABC, ret->wh);
-	memset(ret->col, MASK_ABC, ret->wh);
+	memset(ret->values, ret->all, ret->area);
+	memset(ret->row, ret->all, ret->par.wh);
+	memset(ret->col, ret->all, ret->par.wh);
 	
 	return ret;
 }
@@ -186,20 +287,40 @@ static void free_solver_usage(struct solver_usage *usage) {
 #define solver_isassigned(idx) (usage->grid[idx] > 0)
 
 /* Place values in a final grid and eliminate the possible value in the according row and column */
-static void solver_place(struct solver_usage *usage, int idx, byte val) {
-	int row = idx/usage->wh;
-	int col = idx%usage->wh;
+static void solver_place(struct solver_usage *usage, int idx, byte val, const struct edges *edges) {
+	int row = idx/usage->par.wh;
+	int col = idx%usage->par.wh;
     int i;
 	
 	usage->grid[idx] = val;
 	usage->values[idx] = 0;
 	
 	/* Remove possible values from a row */
-	for(i = idx-col; i<idx-col+usage->wh; i++)
+	for(i = idx-col; i<idx-col+usage->par.wh; i++)
 		solver_removeval(i, val);
 	/* Remove possible values from a column */
-	for(i = col; i<usage->area; i+=usage->wh)
+	for(i = col; i<usage->area; i+=usage->par.wh)
 		solver_removeval(i, val);
+	
+	/* If the placed value is the same as clue value on the edge, then
+	 * eliminate all values towards the edge */
+	 
+	if(val != edges->bottom[col])
+	for(i = idx; i >= col; i-=usage->par.wh)
+		solver_removeval(i, edges->bottom[col]);
+	
+	if(val != edges->top[col])
+	for(i = idx; i <= usage->par.wh*(usage->par.wh-1) + col; i+=usage->par.wh)
+		solver_removeval(i, edges->top[col]);
+	
+	if(val != edges->right[row])
+	for(i = idx; i >= row*usage->par.wh+col; i--)
+		solver_removeval(i, edges->right[row]);
+	
+	if(val != edges->left[row])
+	for(i = idx; i <= row*(usage->par.wh+1)-1; i++)
+		solver_removeval(i, edges->left[row]);
+	
 	/* Remove value from to allocate list */
 	usage->row[row] &= ~val;
 	usage->col[col] &= ~val;
@@ -210,7 +331,7 @@ static void solver_place(struct solver_usage *usage, int idx, byte val) {
 static bool solver_isunique_inrow(struct solver_usage *usage, int row, byte val, int *idx) {
 	byte count = 0;
 	int i;
-	for(i = row*usage->wh; i < (row+1)*usage->wh; i++)
+	for(i = row*usage->par.wh; i < (row+1)*usage->par.wh; i++)
 	if(solver_ispossible(val, usage->values[i]))
 	{
 		if(++count > 1)
@@ -225,7 +346,7 @@ static bool solver_isunique_incol(struct solver_usage *usage, int col, byte val,
 	byte count = 0;
 	
 	int i;
-	for(i = col; i < usage->area; i+=usage->wh)
+	for(i = col; i < usage->area; i+=usage->par.wh)
 	if(solver_ispossible(val, usage->values[i]))
 	{
 		if(++count > 1)
@@ -244,22 +365,27 @@ static bool solver_elim_farpos_inrow(struct solver_usage *usage, const struct ed
 	byte val_elim;
 	byte val_other;
 	
-	int row_beg = row*usage->wh;
-	int row_end = (row+1)*usage->wh-1;
-	int j;
+	int row_beg = row*usage->par.wh;
+	int row_end = (row+1)*usage->par.wh-1;
+	int j, c;
 	
 	/* Left cell */
-	if(solver_ispossible(edges->left[row], usage->row[row])) { /* If value had been placed already it would have been eliminated also */ 
+	if(edges->left[row] && solver_ispossible(edges->left[row], usage->row[row])) { /* If value had been placed already it would have been eliminated also */ 
 	val_elim = edges->left[row];
-	val_other = MASK_ABC ^ val_elim;
+	val_other = usage->all ^ val_elim;
 	j = row_end;
 	/* Begin the search from the opposite end */
-	while((val_other &= ~(usage->values[j] | usage->grid[j])) && j > row_beg)
+	c = 0;
+	while((c += ((val_other & (usage->values[j] | usage->grid[j]))) >= 1) < (usage->par.max-1) && j > row_beg)
+	{
 		j--;
+	}
 	for( ; j <= row_end; j++)
 	if(solver_ispossible(val_elim, usage->values[j])) {
+		if(j == row_beg) // FIX: MOVE THIS OUTSIDE IF
+			continue;
 		#ifdef STANDALONE_SOLVER
-		if(solver_show_working && solver_show_elimination)
+		if(solver_show_working && verbose)
 			printf("far pos elim(from left): row %d \n"
 				   "\telim val %d idx %d\n", row, val_elim, j);
 		#endif
@@ -269,16 +395,21 @@ static bool solver_elim_farpos_inrow(struct solver_usage *usage, const struct ed
 	}
 	
 	/* Right cell */
-	if(solver_ispossible(edges->right[row], usage->row[row])) {
+	if(edges->right[row] && solver_ispossible(edges->right[row], usage->row[row])) {
 	val_elim = edges->right[row];
-	val_other = MASK_ABC ^ val_elim;
+	val_other = usage->all ^ val_elim;
 	j = row_beg;
-	while((val_other &= ~(usage->values[j] | usage->grid[j])) && j < row_end)
+	c = 0;
+	while((c += ((val_other & (usage->values[j] | usage->grid[j])) >= 1)) < (usage->par.max-1) && j < row_end)
+	{
 		j++;
+	}
 	for( ; j >= row_beg; j--)
 	if(solver_ispossible(val_elim, usage->values[j])) {
+		if(j == row_end)
+			continue;
 		#ifdef STANDALONE_SOLVER
-		if(solver_show_working && solver_show_elimination)
+		if(solver_show_working && verbose)
 			printf("far pos elim(from right): row %d \n"
 				   "\telim val %d idx %d\n", row, val_elim, j);
 		#endif
@@ -297,21 +428,27 @@ static bool solver_elim_farpos_incol(struct solver_usage *usage, const struct ed
 	byte val_other;
 	
 	int col_beg = col;
-	int col_end = (usage->wh-1)*usage->wh + col;
-	int j;
+	int col_end = (usage->par.wh-1)*usage->par.wh + col;
+	int j, c;
 	
 	/* Make sure top edge letter isn't the furthest */
-	if(solver_ispossible(edges->top[col], usage->col[col])) {
+	if(edges->top[col] && solver_ispossible(edges->top[col], usage->col[col])) {
 	val_elim = edges->top[col];
-	val_other = MASK_ABC ^ val_elim;
+	val_other = usage->all ^ val_elim;
 	j = col_end;
-	while((val_other &= ~(usage->values[j] | usage->grid[j])) && j > col_beg)
-		j-=usage->wh;
-	for( ; j <= col_end; j+=usage->wh)
+	c = 0;
+	while((c += ((val_other & (usage->values[j] | usage->grid[j]))) >= 1) < (usage->par.max-1) && j > col_beg)
+	{
+		val_other &= ~(usage->values[j] | usage->grid[j]); // FIX: ELIM ONLY ONE VAL NOT ALL OF THEM AT ONCE ----- THIS LOOP HAS TO BE COMPLETELY REMADE
+		j-=usage->par.wh;
+	}
+	for( ; j <= col_end; j+=usage->par.wh)
 	if(solver_ispossible(val_elim, usage->values[j]))
 	{
+		if(j == col_beg)
+		 continue;
 		#ifdef STANDALONE_SOLVER
-		if(solver_show_working && solver_show_elimination)
+		if(solver_show_working && verbose)
 			printf("far pos elim(from top): col %d \n"
 				   "\telim val %d idx %d\n", col, val_elim, j);
 		#endif
@@ -321,17 +458,27 @@ static bool solver_elim_farpos_incol(struct solver_usage *usage, const struct ed
 	}
 	
 	/* Bottom not the furthest */
-	if(solver_ispossible(edges->bottom[col], usage->col[col])) {
+	if(edges->bottom[col] && solver_ispossible(edges->bottom[col], usage->col[col])) {
 	val_elim = edges->bottom[col];
-	val_other = MASK_ABC ^ val_elim;
+	val_other = usage->all ^ val_elim;
 	j = col_beg;
-	while((val_other &= ~(usage->values[j] | usage->grid[j])) && j < col_end)
-		j+=usage->wh;
-	for( ; j >= col_beg; j-=usage->wh)
+	c = 0;
+	while((c += ((val_other & (usage->values[j] | usage->grid[j]))) >= 1) < (usage->par.max-1) && j < col_end)
+	{
+		val_other &= ~(usage->values[j] | usage->grid[j]); // FIX: ELIM ONLY ONE VAL NOT ALL OF THEM AT ONCE ----- THIS LOOP HAS TO BE COMPLETELY REMADE
+		j+=usage->par.wh;
+	}
+	
+	for( ; j < ; j+=usage->par.wh)
+	{
+		for(int i = 0; i < 
+	for( ; j >= col_beg; j-=usage->par.wh)
 	if(solver_ispossible(val_elim, usage->values[j]))
 	{
+		if(j == col_end)
+			continue;
 		#ifdef STANDALONE_SOLVER
-		if(solver_show_working && solver_show_elimination)
+		if(solver_show_working && verbose)
 			printf("far pos elim(from bottom): col %d \n"
 				   "\telim val %d idx %d\n", col, val_elim, j);
 		#endif
@@ -348,12 +495,14 @@ static bool solver_elim_farpos_incol(struct solver_usage *usage, const struct ed
 static bool solver_elim_closepos_inrow(struct solver_usage *usage, const struct edges *edges, int row) {
 	bool ret = false;
 	byte val_elim, val_other;
-	int row_beg = row*usage->wh;
-	int row_end = row*usage->wh + usage->wh-1;
+	int row_beg = row*usage->par.wh;
+	int row_end = row*usage->par.wh + usage->par.wh-1;
 	int j;
 	
 	/* Make sure left edge letter isn't the furthest */
-	val_elim = MASK_ABC ^ edges->left[row];
+	if(edges->left[row])
+	{
+	val_elim = usage->all ^ edges->left[row];
 	val_other = edges->left[row];
 	j=row_beg;
 	while(!(val_other & (usage->values[j] | usage->grid[j])) && j < row_end)
@@ -361,16 +510,19 @@ static bool solver_elim_closepos_inrow(struct solver_usage *usage, const struct 
 	for( ; j>=row_beg; j--)
 	if(solver_ispossible(val_elim, usage->values[j])) {
 		#ifdef STANDALONE_SOLVER
-		if(solver_show_working && solver_show_elimination)
+		if(solver_show_working && verbose)
 			printf("closest pos elimination at row %d\n"
 				   "\tremoving %d at idx %d\n", row, val_elim, j);
 		#endif
 		solver_removeval(j, val_elim);
 		ret = true;
 	}
+	}
 	
 	/* Make sure right edge letter isn't the furthest */
-	val_elim = MASK_ABC ^ edges->right[row];
+	if(edges->right[row])
+	{
+	val_elim = usage->all ^ edges->right[row];
 	val_other = edges->right[row];
 	j=row_end;
 	while(!(val_other & (usage->values[j] | usage->grid[j])) && j > row_beg)
@@ -378,12 +530,13 @@ static bool solver_elim_closepos_inrow(struct solver_usage *usage, const struct 
 	for( ; j<=row_end; j++)
 	if(solver_ispossible(val_elim, usage->values[j])) {
 		#ifdef STANDALONE_SOLVER
-		if(solver_show_working && solver_show_elimination)
+		if(solver_show_working && verbose)
 			printf("closest pos elimination at row %d\n"
 				   "\tremoving %d at idx %d\n", row, val_elim, j);
 		#endif
 		solver_removeval(j, val_elim);
 		ret = true;
+	}
 	}
 	
 	return ret;
@@ -396,42 +549,49 @@ static bool solver_elim_closepos_incol(struct solver_usage *usage, const struct 
 	byte val_other;
 	
 	int col_beg = col;
-	int col_end = (usage->wh-1)*usage->wh + col;
+	int col_end = (usage->par.wh-1)*usage->par.wh + col;
 	int j;
 	
+	
 	/* Make sure top edge letter isn't the furthest */
-	val_elim = MASK_ABC ^ edges->top[col];
+	if(edges->top[col])
+	{
+	val_elim = usage->all ^ edges->top[col];
 	val_other = edges->top[col];
 	j=col_beg;
 	while(!(val_other & (usage->values[j] | usage->grid[j])) && j < col_end)
-		j+=usage->wh;
-	for( ; j>=col_beg; j-=usage->wh)
+		j+=usage->par.wh;
+	for( ; j>=col_beg; j-=usage->par.wh)
 	if(solver_ispossible(val_elim, usage->values[j])) {
 		#ifdef STANDALONE_SOLVER
-		if(solver_show_working && solver_show_elimination)
+		if(solver_show_working && verbose)
 		   printf("closest pos elimination at col %d\n"
 				  "\tremoving %d at idx %d\n", col, val_elim, j);
 		#endif
 		solver_removeval(j, val_elim);
 		ret = true;
 	}
+	}
 	
 	/* Make sure bottom edge letter isn't the furthest */
-	val_elim = MASK_ABC ^ edges->bottom[col];
+	if(edges->bottom[col])
+	{
+	val_elim = usage->all ^ edges->bottom[col];
 	val_other = edges->bottom[col];
 	j=col_end;
 	while(!(val_other & (usage->values[j] | usage->grid[j])) && j > col_beg)
-		j-=usage->wh;
-	for( ; j<=col_end; j+=usage->wh)
+		j-=usage->par.wh;
+	for( ; j<=col_end; j+=usage->par.wh)
 	if(solver_ispossible(val_elim, usage->values[j]))
 	{
 		#ifdef STANDALONE_SOLVER
-		if(solver_show_working && solver_show_elimination)
+		if(solver_show_working && verbose)
 			printf("closest pos elimination at col %d\n"
 				   "\tremoving %d at idx %d\n", col, val_elim, j);
 		#endif
 		solver_removeval(j, val_elim);
 		ret = true;
+	}
 	}
 	
 	return ret;
@@ -441,107 +601,213 @@ static bool solver_elim_closepos_incol(struct solver_usage *usage, const struct 
 static void printvalues(struct solver_usage *usage) {
 	printf("\n");
 	int r, c;
-	for(r = 0; r<usage->wh; r++) 
+	for(r = 0; r<usage->par.wh; r++) 
 	{
-		for(c = 0; c<usage->wh; c++)
-		printf("%2d", usage->values[r*usage->wh+c]);
+		for(c = 0; c<usage->par.wh; c++)
+		printf("%3d", usage->values[r*usage->par.wh+c]);
 	printf("\n");
 	}
-}
-
-static void printresult(struct solver_usage *usage) {
-	printf("\n");
-	int r, c;
-	for(r = 0; r<usage->wh; r++) 
-	{
-		for(c = 0; c<usage->wh; c++)
-		printf("%2d", usage->grid[r*usage->wh+c]);
-	printf("\n");
-	}	
 }
 #endif
 
 /* Check if the grid corresponds to the edges */
-static bool check_valid(byte *grid, const struct edges *edges, int wh)
+static bool check_valid(const game_state *state, bool *reperr, bool *closerr)
 {
-    byte vals[3];
+	int w = state->par.wh;
+	int max = state->par.max;
 	int i, r, c;
-	struct edges from_grid;
-	from_grid.top = snewn(4*wh,byte);
-	from_grid.bottom = from_grid.top + wh;
-	from_grid.left = from_grid.top + 2*wh;
-	from_grid.right = from_grid.top + 3*wh;
+	byte *grid = state->grid;
+	byte lt, rb;
+	bool errs = false;
 	
-	/* Read the closest values to each edge */
- 	for(r = 0; r < wh; r++)
+	if (reperr && closerr)
 	{
-		for(c = i = 0; c < wh; c++)
-		if(grid[r*wh+c] > 0)
-		{
-			if(i < 3)
-				vals[i] = grid[r*wh+c];
-			i++;
-		}
-		
-		if(i != 3)
-		{
-			sfree(from_grid.top);
-			return false;
-		}
-		
-		from_grid.left[r] = vals[0];
-		from_grid.right[r] = vals[2];		
+	for (i = 0; i < w*w; i++)
+	    reperr[i] = false;
+	for (i = 0; i < 4*w; i++)
+		closerr[i] = false;
 	}
 	
-	for(c = 0; c < wh; c++)
-	{
-		for(r = i = 0; r < wh; r++)
-		if(grid[r*wh+c] > 0)
-		{
-			if(i < 3)
-				vals[i] = grid[r*wh+c];
-			i++;
-		}
-		
-		if(i != 3)
-		{
-			sfree(from_grid.top);
-			return false;
-		}
-		
-		from_grid.top[c] = vals[0];
-		from_grid.bottom[c] = vals[2];		
+	for (r = 0; r < w; r++) {
+	byte mask = 0, errmask = 0;
+	
+	c = 0;
+	while(c < w && !grid[r*w+c]) /* Find leftmost value */
+		c++;
+	mask |= grid[r*w+c];
+	lt = mask;
+	
+	c++;
+	for ( ; c < w; c++) {
+	    unsigned long bit = grid[r*w+c];
+	    errmask |= (mask & bit);
+	    mask |= bit;
 	}
 	
-	for(i = 0; i < 4*wh; i++)
-	if(from_grid.top[i] != edges->top[i]) 
-	{
-		sfree(from_grid.top);
-		return false;
+	c = w-1;
+	while(c >= 0 && !grid[r*w+c]) /* Find rightmost value */
+		c--;
+	rb = grid[r*w + c];
+
+	if(reperr) {
+	for (c = 0; c < w; c++)
+		if (errmask & grid[r*w+c])
+		reperr[r*w+c] = true;
 	}
 	
-	sfree(from_grid.top);
-	return true;
+	
+	if(mask == (1 << max) - 1)
+	{	
+		if(state->edges.left[r] && lt != state->edges.left[r])
+		{
+			if(closerr) // FIX: clean this up
+			closerr[2*w+r] = true;
+		
+			errs = true;
+		}
+		if(state->edges.right[r] && rb != state->edges.right[r])
+		{
+			if(closerr)
+			closerr[3*w+r] = true;
+		
+			errs = true;
+		}
+	}
+	else 
+		errs = true;
+	}
+	
+	for (c = 0; c < w; c++) {
+	byte mask = 0, errmask = 0;
+	
+	r = 0;
+	while(r < w && !grid[r*w+c]) /* Find upmost value */
+		r++;
+	mask |= grid[r*w+c];
+	lt = mask;
+	r++;
+	
+	for ( ; r < w; r++) {
+	    byte bit = grid[r*w+c];
+	    errmask |= (mask & bit);
+	    mask |= bit;
+	}
+	
+	r = w-1;
+	while(r >= 0 && !grid[r*w+c]) /* Find downmost value */
+		r--;
+	rb = grid[r*w + c];
+	
+	if(reperr)
+	{
+	for (r = 0; r < w; r++)
+		if (errmask & grid[r*w+c])
+		reperr[r*w+c] = true;
+	}
+	  
+	if(mask == (1 << max) - 1)
+	{
+		if(state->edges.top[c] && lt != state->edges.top[c])
+		{
+			if(closerr)
+			closerr[c] = true;
+		
+			errs = true;
+		}
+		
+		if(state->edges.bottom[c] && rb != state->edges.bottom[c])
+		{
+			if(closerr)
+			closerr[w+c] = true;
+		
+			errs = true;
+		}
+	}
+	else 
+		errs = true;
+	}
+	
+	return !errs; /* success, no errors */
+}
+
+int count_set_bits(byte b)
+{
+	int c = 0;
+	while(b != 0)
+	{
+		if(b & 1)
+		c++;
+		
+		b >>= 1;
+	}
+	return c;
 }
 
 static bool solver(struct solver_usage *usage, const struct edges *edges)
 {	
 	bool res;
 	int i, idx, val;
+	int wh = usage->par.wh;
 	
 	do {
 	res = false;
 	
 	/* Eliminating values which would contradict game's definition */
-	for(i = 0; i<usage->wh; i++)
+	for(i = 0; i<usage->par.wh; i++)
 	res |= solver_elim_closepos_inrow(usage, edges, i) ||
 		solver_elim_farpos_inrow(usage, edges, i) ||
 		solver_elim_closepos_incol(usage, edges, i) ||
 		solver_elim_farpos_incol(usage, edges, i);
 	
+	/* ----- new --- */
+	int r, c, pos;
+	for(r = 0; r<usage->par.wh; r++)
+	{
+		pos = 0;
+		for(c = 0; c<usage->par.wh; c++)
+		{
+		if(usage->values[r*wh+c] != 0)
+		pos++;
+		}
+		/* Available slots == count of values left to alloc */
+		if(pos == count_set_bits(usage->row[r]))
+		for(c = 0; c<usage->par.wh; c++)
+		{
+		if(count_set_bits(usage->values[r*usage->par.wh+c]) == 1)
+		{
+			#ifdef STANDALONE_SOLVER
+			printf("New elim at row %d at idx %d\n", r, r*wh+c);
+			#endif
+			solver_place(usage, r*wh+c, usage->values[r*wh+c], edges);
+		}
+		}
+	}
+	
+	for(c = 0; c<usage->par.wh; c++)
+	{
+		pos = 0;
+		for(r = 0; r<usage->par.wh; r++)
+		{
+		if(usage->values[r*wh+c] != 0)
+		pos++;
+		}
+		/* Available slots == count of values left to alloc */
+		if(pos == count_set_bits(usage->col[c]))
+		for(r = 0; r<usage->par.wh; r++)
+		{
+		if(count_set_bits(usage->values[r*usage->par.wh+c]) == 1)
+		{
+			#ifdef STANDALONE_SOLVER
+			printf("New elim at col %d at idx %d\n", c, r*wh+c);
+			#endif
+			solver_place(usage, r*wh+c, usage->values[r*wh+c], edges);
+		}
+		}
+	}			
+		
 	/* Place unique values in rows and columns */
-	for(i = 0; i<usage->wh; i++)
-	for(val = 1; val <= MASK_ABC; val<<=1)
+	for(i = 0; i<usage->par.wh; i++)
+	for(val = 1; val <= usage->all; val<<=1)
 	{
 		if(solver_ispossible(val, usage->row[i]) && /* Check if the value is required in this row */
 			solver_isunique_inrow(usage, i, val, &idx))
@@ -551,7 +817,7 @@ static bool solver(struct solver_usage *usage, const struct edges *edges)
 				printf("unique val in row %d\n"
 			           "\tplacing %d at idx %d\n", i, val, idx);
 			#endif
-			solver_place(usage, idx, val);
+			solver_place(usage, idx, val, edges);
 			res = true;
 		}
 	
@@ -561,9 +827,9 @@ static bool solver(struct solver_usage *usage, const struct edges *edges)
 			#ifdef STANDALONE_SOLVER
 			if(solver_show_working)
 				printf("unique val in col %d\n"
-					   "\tplacing %d at idx %d\n", i, val, idx);
+					   "\tplacing %d at idx %d\n", i, val, idx, edges);
 			#endif
-			solver_place(usage, idx, val);
+			solver_place(usage, idx, val, edges);
 			res = true;
 		}
 	}
@@ -571,178 +837,43 @@ static bool solver(struct solver_usage *usage, const struct edges *edges)
 	
 	res = true;
 	
+	/* FIX: fake game state for check_valid */
+	game_state *temp = snew(game_state);
+	temp->par.wh = usage->par.wh;
+	temp->par.max = usage->par.max;
+	temp->edges.top = edges->top;
+	temp->edges.bottom = edges->bottom;
+	temp->edges.left = edges->left;
+	temp->edges.right = edges->right;
+	temp->grid = usage->grid;
+	
 	/* Final check for board validity */
-	if(!check_valid(usage->grid, edges, usage->wh))
+	if(!check_valid(temp, NULL, NULL))
 		res = false;
 	
-	for(i = 0; i < usage->wh; i++)
+	for(i = 0; i < usage->par.wh; i++)
 	if(usage->row[i] > 0 || usage->col[i])
 		res = false;
 	
 	#ifdef STANDALONE_SOLVER
 	if(solver_show_working) {
-		if(solver_show_elimination)
+		if(!res)
+		{
+		printf("solution not found.\n");
+		if(verbose)
 		{
 			printvalues(usage);
 			printf("\n");
 		}
-		if(!res)
-			printf("solution not found.\n");
-		printresult(usage);
+		}	
 	}
 	#endif
+
+	sfree(temp);
 	
 	return res;
 }
 
-#ifdef NEW_GAME_DESC_VERSION_1
-/* Generate random edges
- * first ensure that at least one of each A, B and C is present,
- * then fill the rest of the cells in */
- 
-int cmpfunc (const void * a, const void * b) {
-   return (*(int*)a - *(int*)b);
-}
-
-static void random_edges(const game_params *params, random_state *rs, 
-						struct edges *edges) {
-	static byte vals_arr[] = {MASK_A, MASK_B, MASK_C}; /* Shuffle ABC for random generation */
-	static int shuf_idx[3];
-	int i;
-	
-	shuffle(vals_arr, 3, sizeof(byte), rs);
-	shuf_idx[0] = random_upto(rs, params->wh);
-	while((shuf_idx[1] = random_upto(rs, params->wh)) == shuf_idx[0])
-		;
-	while((shuf_idx[2] = random_upto(rs, params->wh)) == shuf_idx[1] || shuf_idx[2] == shuf_idx[0])
-		;
-	for(i = 0; i < 3; i++)
-		edges->top[shuf_idx[i]] = vals_arr[i];
-	
-	shuffle(vals_arr, 3, sizeof(byte), rs);
-	shuf_idx[0] = random_upto(rs, params->wh);
-	while(vals_arr[0] == edges->top[shuf_idx[0]])
-		shuf_idx[0] = random_upto(rs, params->wh);
-	while((shuf_idx[1] = random_upto(rs, params->wh)) == shuf_idx[0] || \
-		   vals_arr[1] == edges->top[shuf_idx[1]])
-		shuf_idx[1] = random_upto(rs, params->wh);
-	while((shuf_idx[2] = random_upto(rs, params->wh)) == shuf_idx[1] || shuf_idx[2] == shuf_idx[0]
-		  || vals_arr[2] == edges->top[shuf_idx[2]])
-		shuf_idx[2] = random_upto(rs, params->wh);
-	
-	for(i = 0; i < 3; i++)
-	edges->bottom[shuf_idx[i]] = vals_arr[i];
-	
-	for(i = 0; i < params->wh; i++)
-	if(edges->top[i] == 0)
-	{
-		shuffle(vals_arr, 3, sizeof(byte), rs);
-		if((edges->top[i] = vals_arr[0]) == edges->bottom[i])
-				edges->top[i] = vals_arr[1];
-	}
-	
-	for(i = 0; i < params->wh; i++)
-	if(edges->bottom[i] == 0)
-	{
-		shuffle(vals_arr, 3, sizeof(byte), rs);
-		if((edges->bottom[i] = vals_arr[0]) == edges->top[i])
-			edges->bottom[i] = vals_arr[1];
-	}
-	
-	vals_arr[0] = edges->top[0];
-	vals_arr[2] = edges->bottom[0];
-	vals_arr[1] = MASK_ABC ^ (vals_arr[0] | vals_arr[2]);
-	
-	shuf_idx[0] = random_upto(rs, params->wh);
-	while((shuf_idx[1] = random_upto(rs, params->wh)) == shuf_idx[0])
-		;
-	while((shuf_idx[2] = random_upto(rs, params->wh)) == shuf_idx[1] || shuf_idx[2] == shuf_idx[0])
-		;
-	
-	qsort(shuf_idx, 3, sizeof(int), cmpfunc);
-	for(i = 0; i < 3; i++)
-		edges->left[shuf_idx[i]] = vals_arr[i];
-	for(i = 0; i < params->wh; i++)
-	{
-		if(edges->left[i] == 0)
-		{
-			shuffle(vals_arr, 3, sizeof(byte), rs);
-			edges->left[i] = vals_arr[0];
-		}
-	}
-
-	for(i = 0; i < params->wh; i++)
-	{
-		if(edges->right[i] == 0)
-		{
-			shuffle(vals_arr, 3, sizeof(byte), rs);
-			if((edges->right[i] = vals_arr[0]) == edges->left[i])
-				edges->right[i] = vals_arr[1];
-		}
-	}
-}
-
-static char *new_game_desc(const game_params *params, random_state *rs,
-			   char **aux, bool interactive) {
-    #ifdef STANDALONE_SOLVER
-	int idcounter = 0;
-	#endif
-	int wh = params->wh;
-	int area = params->wh*params->wh;
-	int	desc_len = 4*params->wh + 1;
-	int i;
-	char *desc = snewn(desc_len, char);
-    struct solver_usage *usage = new_solver_usage(params);
-	struct edges edges;
-	edges.top = (unsigned char *)desc;
-	edges.bottom = edges.top + wh;
-	edges.left = edges.top + 2*wh;
-	edges.right = edges.top + 3*wh;
-	desc[desc_len-1] = '\0';
-	
-	while(1)
-	{
-		#ifdef STANDALONE_SOLVER
-		idcounter++;
-		#endif
-		memset(desc, 0, desc_len);
-		random_edges(params, rs, &edges);
-		if(solver(usage, &edges))
-			break;
-		memset(usage->grid, 0, area);
-		memset(usage->values, MASK_ABC, area);
-		memset(usage->row, MASK_ABC, wh);
-		memset(usage->col, MASK_ABC, wh);
-	}
-	
-	if (*aux)
-		sfree(*aux);
-	
-	*aux = snewn(area+2, char);
-	(*aux)[0] = 'S';
-	memcpy((*aux)+1, usage->grid, area);
-	for(i = 1; i <= wh*wh; i++)
-	if((*aux)[i] == 0)
-		(*aux)[i] = ' ';
-	
-	(*aux)[area+1] = '\0';
-	
-	free_solver_usage(usage);
-	{
-	for(i = 0; i < desc_len-1; i++)
-		desc[i] = (desc[i] >> 1) + 'A';
-    }
-
-	#ifdef STANDALONE_SOLVER
-	printf("idcounter:%d\n", idcounter);
-	#endif
-	
-	return desc;
-}
-#endif
-
-#ifdef NEW_GAME_DESC_VERSION_2
-#include "latin.h"
 static char *new_game_desc(const game_params *params, random_state *rs,
 			   char **aux, int interactive)
 {
@@ -751,20 +882,21 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 	#endif
 	int wh = params->wh;
 	int area = wh*wh;
-	int	desc_len = 4*params->wh + 1;
 	int i, r, c;
-	char *desc = snewn(desc_len, char);
-	byte *grid = NULL;
+	char *desc, *p;
+	byte *grid = NULL, *order;
 	struct solver_usage *usage = new_solver_usage(params);
 	struct edges edges;
-	edges.top = desc;
+	edges.top = snewn(4*wh, byte);
 	edges.bottom = edges.top + wh;
 	edges.left = edges.top + 2*wh;
 	edges.right = edges.top+ 3*wh;
-	desc[desc_len-1] = '\0';
+	byte *extra = snewn(area, byte);
 	
+	order = snewn(max(4*wh,area), byte);
 	while(1)
 	{
+		bool ret = false; //
 		#ifdef STANDALONE_SOLVER
 		idcounter++;
 		#endif
@@ -774,17 +906,20 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 		grid = latin_generate(wh, rs);
 	
 		for(i = 0; i < wh*wh; i++)
-		if(grid[i] != MASK_A && grid[i] != MASK_B && grid[i] != MASK_C)
+		if(grid[i] > params->max)
 		grid[i] = 0;
+		else 
+		grid[i] = 1 << (grid[i] - 1);
 	
-		
+	
+		// FIX: This loop was designed with only A-C in mind. Revise this loop */
 		/* Read the closest values to each edge */
 		byte enc, val, valc; /* values encounter in the row or col so far */
  		for(r = 0; r < wh; r++)
 		{
 			enc = 0, val = 0, valc = 0;
 			c = 0;
-			while(valc < 2)
+			while(valc < (params->max-1))
 			{
 				if((val = grid[r*wh+c]) > 0)
 				{
@@ -795,14 +930,14 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 				}
 				c++;
 			}
-			edges.right[r] = MASK_ABC ^ enc;
+			edges.right[r] = usage->all ^ enc;
 		}
 		
 		for(c = 0; c < wh; c++)
 		{
 			enc = 0, val = 0, valc = 0;
 			r = 0;
-			while(valc < 2)
+			while(valc < (params->max-1))
 			{
 				if((val = grid[r*wh+c]) > 0)
 				{
@@ -813,68 +948,216 @@ static char *new_game_desc(const game_params *params, random_state *rs,
 				}
 				r++;
 			}
-			edges.bottom[c] = MASK_ABC ^ enc;
+			edges.bottom[c] = usage->all ^ enc;
 		}
+		
+		memset(extra, 0, wh*wh);
 		
 		if(solver(usage, &edges))
 		{
 			#ifdef STANDALONE_SOLVER
 			printf("idcounter:%d\n", idcounter);
 			#endif
-			break;	/* the solution is unique */
+			break;
+		}
+		memset(usage->grid, 0, wh*wh);
+		memset(usage->values, usage->all, wh*wh);
+		memset(usage->row, usage->all, params->wh);
+		memset(usage->col, usage->all, params->wh);
+		
+		
+		/* FIX: Reveal some values on the board */
+		/* ------- */
+		
+		int count = 0; // FIX: NOT ISOC90
+		for (i = 0; i < area; i++)
+			order[i] = i;
+		shuffle(order, area, sizeof(*order), rs);
+		for (i = 0; i < area && count < params->max-1; i++) { /* count limit is a somewhat arbitary */
+			int j = order[i];
+			if(!grid[j] || usage->grid[j])
+				continue;
+			solver_place(usage, j, grid[j], &edges);
+			extra[j] = grid[j]; //
+			++count;
+			if(solver(usage, &edges))
+				goto end; // FIX
 		}
 		
+		/* ------ */
+		
 		memset(usage->grid, 0, wh*wh);
-		memset(usage->values, MASK_ABC, wh*wh);
-		memset(usage->row, MASK_ABC, params->wh);
-		memset(usage->col, MASK_ABC, params->wh);
+		memset(usage->values, usage->all, wh*wh);
+		memset(usage->row, usage->all, params->wh);
+		memset(usage->col, usage->all, params->wh);
 	}
+	end:
+	/* Hide the unnecessary clues */
+	if(params->diff > DIFF_EASY)
+	{
+	for (i = 0; i < 4*wh; i++)
+	order[i] = i;
+	shuffle(order, 4*wh, sizeof(*order), rs);
+	for (i = 0; i < 4*wh; i++) {
+		int j = order[i];
+		int clue = edges.top[j];
+
+		//memcpy(soln2, grid, a);
+		edges.top[j] = 0;
+		
+		// ----
+		memset(usage->values, usage->all, wh*wh);
+		memset(usage->row, usage->all, params->wh);
+		memset(usage->col, usage->all, params->wh);
+		memset(usage->grid, 0, wh*wh);
+		for(int k = 0; k < area; k++) // not ISOC90
+		if(extra[k])
+		solver_place(usage, k, extra[k], &edges);
+		//-----
 	
+		
+		if(!solver(usage, &edges))
+			edges.top[j] = clue;
+	}
+	}
+			memset(usage->values, usage->all, wh*wh);
+		memset(usage->row, usage->all, params->wh);
+		memset(usage->col, usage->all, params->wh);
+		memset(usage->grid, 0, wh*wh);
+		for(int k = 0; k < area; k++) // not ISOC90
+		if(extra[k])
+		solver_place(usage, k, extra[k], &edges);
+	solver(usage, &edges);
+	/*
+     * Encode the puzzle description.
+     */
+    desc = snewn(40*area, char);
+    p = desc;
+    for (i = 0; i < 4*wh; i++) {
+        if (i)
+            *p++ = '/';
+        if (edges.top[i])
+            *p++ = (char)log2(edges.top[i]) + 'A';
+    }
+	/* FIX: immutable squares */
+	/* ------ */
+	
+    for (i = 0; i < area; i++)
+	if (extra[i])
+	    break;
+    if (i < area) {
+	*p++ = ',';
+	
+	char temp[32];
+	for( ; i < area; i++)
+	if(extra[i])
+	{
+		itoa(i, temp, 10);
+		char *t = temp;
+		while(*t)*p++ = *t++;
+			;
+		*p++ = (char)log2(extra[i])+'A';
+	}
+    }
+	
+	/* ------ */
+    *p++ = '\0';
+    desc = sresize(desc, p - desc, char);
+	
+	/*
+     * Encode the solution.
+     */
 	if (*aux)
 		sfree(*aux);
-	
 	*aux = snewn(area+2, char);
 	(*aux)[0] = 'S';
 	memcpy((*aux)+1, usage->grid, area);
 	for(i = 1; i <= wh*wh; i++)
 	if((*aux)[i] == 0)
 		(*aux)[i] = ' ';
-
-	free_solver_usage(usage);
+	(*aux)[area+1] = '\0';
 	
-	for(i = 0; i < desc_len - 1; i++)
-		desc[i] = (desc[i] >> 1) + 'A';
+	sfree(extra);
+	sfree(order);
+	sfree(edges.top);
+	free_solver_usage(usage);
+
+	#ifdef STANDALONE_SOLVER
+	printf("idcounter:%d\n", idcounter);
+	#endif
 	
 	return desc;
 }
-#endif
 
 static const char *validate_desc(const game_params *params, const char *desc)
 {
-	int i;
-	for(i = 0; (i < 4*params->wh) && desc[i] != '\0'; i++)
-	if(desc[i] != 'A' && desc[i] != 'B' && desc[i] != 'C')
-		return "Only As, Bs and Cs are allowed in game description.";
+    int w = params->wh, a = w*w;
+    const char *p = desc;
+    int i, clue;
+
+    /*
+     * Verify that the right number of clues are given, and that
+     * they're in range.
+     */
+    for (i = 0; i < 4*w; i++) {
+	if (!*p)
+	    return "Too few clues for grid size";
+
+	if (i > 0) {
+	    if (*p != '/')
+		return "Expected commas between clues";
+	    p++;
+	}
+
+	if (isalpha((unsigned char)*p)) {
+	    if (*p < 'A' || *p > 'A'+params->max-1)
+		return "Clue letter out of range";
+		
+		p++;
+	}
+    }
+    if (*p == '/')
+	return "Too many clues for grid size";
 	
-	if(i < 4*params->wh)
-		return "Game description is too short.";
+	if(*p == ',') {
+	int pos = 0;
+	p++;
+	while (*p) {
+	    if (isdigit(*p)) {
+			pos = atoi(p);
+			if(pos < 0 || pos >= a)
+			return "Invalid grid index";
+		
+			while (*p && isdigit((unsigned char)*p)) p++;
+		} else if (*p == '_') {
+		/* do nothing */;
+	    } else if (isalpha(*p)) {
+			if(*p < 'A' || *p > 'A' + params->max - 1)
+			return "Grid letter out of range";
+			
+			p++;
+		}
+	    else
+			return "Invalid character in game description";
+	}
+	}
 	
-	return NULL;
+    return NULL;
 }
 
 static key_label *game_request_keys(const game_params *params, int *nkeys)
 {
     int i;
-    key_label *keys = snewn(3, key_label);
-    *nkeys = 3 + 1;
+    key_label *keys = snewn(params->max, key_label);
+    *nkeys = params->max + 1;
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < params->max; i++) {
 		keys[i].button = 'a' + i;
         keys[i].label = NULL;
     }
 	
-    keys[3].button = '\b';
-    keys[3].label = NULL;
+    keys[params->max].button = '\b';
+    keys[params->max].label = NULL;
 
     return keys;
 }
@@ -884,9 +1167,11 @@ static game_state *new_game(midend *me, const game_params *params,
 {
 	game_state *state = snew(game_state);
 	
+	const char *p = desc;
 	int wh, area;
     int i;
-	state->wh = wh = params->wh;
+	state->par.wh = wh = params->wh;
+	state->par.max = params->max;
 	area = wh*wh;
 	
 	state->edges.top = snewn(4*wh, byte);
@@ -894,8 +1179,17 @@ static game_state *new_game(midend *me, const game_params *params,
 	state->edges.left = state->edges.top + 2*wh;
 	state->edges.right = state->edges.top + 3*wh;
 	
-	for(i = 0; i < 4*wh; i++)
-	state->edges.top[i] = 1 << (desc[i] - 'A');
+	for (i = 0; i < 4*wh; i++) {
+	if (i > 0) {
+	    assert(*p == '/');
+	    p++;
+	}
+	if (*p && isalpha((unsigned char)*p)) {
+	    state->edges.top[i] = 1 << (*p - 'A');
+	    p++;
+	} else
+	    state->edges.top[i] = 0;
+    }
 
 	state->clues_completed = snewn(4*wh, bool);
 	memset(state->clues_completed, 0, 4*wh);
@@ -905,27 +1199,52 @@ static game_state *new_game(midend *me, const game_params *params,
 	state->pencil = snewn(area, byte);
 	memset(state->pencil, 0, area);
 	
+	state->immutable = snewn(area, bool);
+	memset(state->immutable, 0, area);
+	
+	if (*p == ',') {
+	int pos = 0;
+	p++;
+	while (*p) {
+	    if (isdigit(*p)) {
+		pos = atoi(p);
+		while (*p && isdigit((unsigned char)*p)) p++;
+	    } else if (*p == '_') {
+		/* do nothing */;
+	    } else if (isalpha(*p)) {
+			state->grid[pos] = 1 << (*p - 'A');
+			state->immutable[pos] = true;
+			p++;
+		}
+	    else
+			assert(!"Corrupt game description");
+	}
+	}
+    assert(!*p);
+	
 	state->completed = state->cheated = false;
 	
 	return state;
 }
 
 static game_state *dup_game(const game_state *state)
-{
-	game_state *ret = snew(game_state);
-	
+{	
 	int wh, area;
-	ret->wh = wh = state->wh;
+	wh = state->par.wh;
 	area = wh*wh;
 	
-	ret->edges.top = snewn(4*wh, byte);
+	game_state *ret = snew(game_state);
+	
+	ret->par = state->par;
+	
+	ret->edges.top = state->edges.top;
 	ret->edges.bottom = state->edges.top + wh;
 	ret->edges.left = state->edges.top + 2*wh;
 	ret->edges.right = state->edges.top + 3*wh;
-	memcpy(ret->edges.top, state->edges.top, 4*wh);
+	ret->immutable = state->immutable;
 	
 	ret->clues_completed = snewn(4*wh, bool);
-	memcpy(ret->clues_completed, state->clues_completed, 4*wh);
+	memcpy(ret->clues_completed, state->clues_completed, 4*wh*sizeof(bool));
 	ret->grid = snewn(area, byte);
 	memcpy(ret->grid, state->grid, area);
 	ret->pencil = snewn(area, byte);
@@ -939,10 +1258,9 @@ static game_state *dup_game(const game_state *state)
 
 static void free_game(game_state *state)
 {
-	sfree(state->edges.top);
-	sfree(state->clues_completed);
 	sfree(state->grid);
 	sfree(state->pencil);
+	sfree(state->clues_completed);
 	sfree(state);
 }
 		
@@ -950,10 +1268,11 @@ static char *solve_game(const game_state *state, const game_state *currstate,
                         const char *aux, const char **error)
 {
 	char *ret;
-	int wh = state->wh;
+	int wh = state->par.wh;
 	int i ;
     game_params params; /* faking params for solver_usage */
     params.wh = wh;
+	params.max = state->par.max;
 	
 	if (aux)
        return dupstr(aux);
@@ -992,7 +1311,62 @@ static bool game_can_format_as_text_now(const game_params *params)
 
 static char *game_text_format(const game_state *state)
 {
-    return NULL;
+	int wh = state->par.wh; /* , a = wh*wh */;
+    char *ret;
+    char *p;
+    int x, y;
+    int total;
+
+    /*
+	 * same as towers.c
+     */
+	
+    total = 2*wh*wh + 10*wh + 9;
+    ret = snewn(total, char);
+    p = ret;
+
+    /* Top clue row. */
+    *p++ = ' '; *p++ = ' ';
+    for (x = 0; x < wh; x++) {
+	*p++ = ' ';
+	*p++ = (state->edges.top[x] ? 'A' + (char)log2(state->edges.top[x]) : ' ');
+    }
+    *p++ = '\n';
+
+    /* Blank line. */
+    *p++ = '\n';
+
+    /* Main grid. */
+    for (y = 0; y < wh; y++) {
+	*p++ = (state->edges.top[y+2*wh] ? 'A' + (char)log2(state->edges.top[y+2*wh]) :
+		' ');
+	*p++ = ' ';
+	for (x = 0; x < wh; x++) {
+	    *p++ = ' ';
+	    *p++ = (state->grid[y*wh+x] ? 'A' + (char)log2(state->grid[y*wh+x]) : ' ');
+	}
+	*p++ = ' '; *p++ = ' ';
+	*p++ = (state->edges.top[y+3*wh] ? 'A' + (char)log2(state->edges.top[y+3*wh]) :
+		' ');
+	*p++ = '\n';
+    }
+
+    /* Blank line. */
+    *p++ = '\n';
+
+    /* Bottom clue row. */
+    *p++ = ' '; *p++ = ' ';
+    for (x = 0; x < wh; x++) {
+	*p++ = ' ';
+	*p++ = (state->edges.top[x+wh] ? 'A' + (char)log2(state->edges.top[x+wh]) :
+		' ');
+    }
+    *p++ = '\n';
+
+    *p++ = '\0';
+    assert(p == ret + total);
+
+    return ret;
 }
 
 struct game_ui {
@@ -1027,7 +1401,7 @@ static void decode_ui(game_ui *ui, const char *encoding)
 static void game_changed_state(game_ui *ui, const game_state *oldstate,
                                const game_state *newstate)
 {
-	int wh = newstate->wh;
+	int wh = newstate->par.wh;
     /* Prevent pencil-mode highlighting */
     if (ui->hshow && ui->hpencil && !ui->hcursor &&
         newstate->grid[ui->hy * wh + ui->hx] != 0) {
@@ -1050,19 +1424,32 @@ static void game_changed_state(game_ui *ui, const game_state *oldstate,
     else \
 	x = w, y = index-3*w; \
 } while (0)
+	
+#define DF_PENCIL_SHIFT 16
+#define DF_CLUE_DONE 0x10000
+#define DF_ERROR 0x8000
+#define DF_HIGHLIGHT 0x4000
+#define DF_HIGHLIGHT_PENCIL 0x2000
+#define DF_IMMUTABLE 0x1000
+#define DF_PENCIL_XMARK 0x0400
+#define DF_DIGIT_MASK 0x00FF
+
+
 struct game_drawstate {
     bool started;
     int wh;
     int tilesize;
-	struct edges edges;
+	long *clues;
 	bool *clues_completed;
-    byte *grid;
+    long *grid;
     byte *pencil;
+	bool *err1;
+	bool *err2;
 };
 
 static int clue_index(const game_state *state, int x, int y)
 {
-    int w = state->wh;
+    int w = state->par.wh;
 
     if (x == -1 || x == w)
         return w * (x == -1 ? 2 : 3) + y;
@@ -1074,7 +1461,7 @@ static int clue_index(const game_state *state, int x, int y)
 
 static bool is_clue(const game_state *state, int x, int y)
 {
-    int w = state->wh;
+    int w = state->par.wh;
 
     if (((x == -1 || x == w) && y >= 0 && y < w) ||
         ((y == -1 || y == w) && x >= 0 && x < w))
@@ -1087,7 +1474,7 @@ static char *interpret_move(const game_state *state, game_ui *ui,
                             const game_drawstate *ds,
                             int x, int y, int button)
 {
-    int wh = state->wh;
+    int wh = state->par.wh;
     int tx, ty;
     char buf[80];
 	
@@ -1151,15 +1538,15 @@ static char *interpret_move(const game_state *state, game_ui *ui,
     }
 
     if (ui->hshow &&
-	   ((button >= 'A' && button <= 'C')||
-	    (button >= 'a' && button <= 'c')||
+	   ((button >= 'A' && button < 'A' + state->par.max)||
+	    (button >= 'a' && button < 'a' + state->par.max)||
 	     button == CURSOR_SELECT2 || button == '\b')) {
 		int n;
-		if (button >= 'A' && button <= 'C')
-			n = button - 'A'+1;
-		if (button >= 'a' && button <= 'c')
-			n = button - 'a'+1;
-		if (button == CURSOR_SELECT2 || button == '\b')
+		if (button >= 'A' && button < 'A' + state->par.max)
+			n = button - 'A' + 1;
+		else if (button >= 'a' && button < 'a' + state->par.max)
+			n = button - 'a' + 1;
+		else if (button == CURSOR_SELECT2 || button == '\b')
 			n = 0;
 
         /*
@@ -1179,6 +1566,9 @@ static char *interpret_move(const game_state *state, game_ui *ui,
 		return dupstr(buf);
     }
 	
+	
+	// FIX 'X'
+	#if 0
 	if(ui->hshow && (button == 'X' || button == 'x'))
 	{
 		sprintf(buf, "%c%d,%d", (char)('X'), ui->hx, ui->hy);
@@ -1188,6 +1578,7 @@ static char *interpret_move(const game_state *state, game_ui *ui,
 		
 		return dupstr(buf);
 	}
+	#endif
 
     if (button == 'M' || button == 'm')
         return dupstr("M");
@@ -1197,7 +1588,7 @@ static char *interpret_move(const game_state *state, game_ui *ui,
 
 static game_state *execute_move(const game_state *from, const char *move)
 {
-    int wh = from->wh;
+    int wh = from->par.wh;
     game_state *ret;
     int x, y, n, i;
 
@@ -1206,7 +1597,7 @@ static game_state *execute_move(const game_state *from, const char *move)
 		ret->completed = ret->cheated = true;
 		
 		for(i = 1; i < wh*wh+1; i++)
-		if((move[i] & ~MASK_ABC) && move[i] != ' ')
+		if((move[i] & ~((1 << from->par.max)-1)) && move[i] != ' ')
 		{
 			free_game(ret);
 			return NULL;
@@ -1229,7 +1620,7 @@ static game_state *execute_move(const game_state *from, const char *move)
 		return ret;
     } else if ((move[0] == 'P' || move[0] == 'R') &&
 				sscanf(move+1, "%d,%d,%d", &x, &y, &n) == 3 &&
-				x >= 0 && x < wh && y >= 0 && y < wh && n >= 0 && n <= 3) {
+				x >= 0 && x < wh && y >= 0 && y < wh && n >= 0 && n <= from->par.max) {
 		ret = dup_game(from);
         if (move[0] == 'P' && n > 0)
             ret->pencil[y*wh+x] ^= 1 << (n-1);
@@ -1237,7 +1628,7 @@ static game_state *execute_move(const game_state *from, const char *move)
             ret->grid[y*wh+x] = 1 << (n-1);
             ret->pencil[y*wh+x] = 0;
 			
-            if (!ret->completed && check_valid(ret->grid, &ret->edges, wh))
+            if (!ret->completed && check_valid(ret, NULL, NULL))
                 ret->completed = true;
 		}
 		
@@ -1253,7 +1644,7 @@ static game_state *execute_move(const game_state *from, const char *move)
 		ret = dup_game(from);
 		for(i = 0; i < wh*wh; i++)
 		if(!ret->grid[i] && !(ret->pencil[i] & MASK_X))
-			ret->pencil[i] = MASK_ABC;
+			ret->pencil[i] = (1 << from->par.max)-1;
 		
 		return ret;
 	} else if (move[0] == 'D' && sscanf(move+1, "%d,%d", &x, &y) == 2 &&
@@ -1303,6 +1694,10 @@ static float *game_colours(frontend *fe, int *ncolours)
     ret[COL_HIGHLIGHT * 3 + 0] = 0.78F * ret[COL_BACKGROUND * 3 + 0];
     ret[COL_HIGHLIGHT * 3 + 1] = 0.78F * ret[COL_BACKGROUND * 3 + 1];
     ret[COL_HIGHLIGHT * 3 + 2] = 0.78F * ret[COL_BACKGROUND * 3 + 2];
+	
+	ret[COL_ERROR * 3 + 0] = 1.0F;
+    ret[COL_ERROR * 3 + 1] = 0.0F;
+    ret[COL_ERROR * 3 + 2] = 0.0F;
 
     ret[COL_PENCIL * 3 + 0] = 0.5F * ret[COL_BACKGROUND * 3 + 0];
     ret[COL_PENCIL * 3 + 1] = 0.5F * ret[COL_BACKGROUND * 3 + 1];
@@ -1319,23 +1714,31 @@ static float *game_colours(frontend *fe, int *ncolours)
 static game_drawstate *game_new_drawstate(drawing *dr, const game_state *state)
 {
     struct game_drawstate *ds = snew(struct game_drawstate);
-	int wh = state->wh;
+	int wh = state->par.wh;
+	int i;
 
 	ds->tilesize = 0;
 	ds->started = false;
     ds->wh = wh;
-    ds->grid = snewn(wh*wh, byte);
+    ds->grid = snewn(wh*wh, long);
+    for(i = 0; i < wh*wh; i++)
+		ds->grid[i] = -1;
+	
 	ds->pencil = snewn(wh*wh, byte);
-    memset(ds->grid, MASK_ABC+1, wh*wh); /* Force redraw */
 	memset(ds->pencil, 0, wh*wh);
 	
-	ds->edges.top = snewn(4*wh, byte);
-	ds->edges.bottom = ds->edges.top + wh;
-	ds->edges.left = ds->edges.top + 2*wh;
-	ds->edges.right = ds->edges.top + 3*wh;
-	memset(ds->edges.top, 0, 4*wh);
+	ds->clues = snewn(4*wh, long);
+	for(i = 0; i < 4*wh; i++)
+		ds->clues[i] = -1;
+	
 	ds->clues_completed = snewn(4*wh, bool);
 	memset(ds->clues_completed, 0, 4*wh);
+	
+	ds->err1 = snewn(wh*wh, bool);
+	memset(ds->err1, 0, wh*wh);
+	
+	ds->err2 = snewn(4*wh, bool);
+	memset(ds->err2, 0, 4*wh);
 	
     return ds;
 }
@@ -1344,15 +1747,17 @@ static void game_free_drawstate(drawing *dr, game_drawstate *ds)
 {
     sfree(ds->grid);
 	sfree(ds->pencil);
-	sfree(ds->edges.top);
+	sfree(ds->clues);
 	sfree(ds->clues_completed);
+	sfree(ds->err1);
+	sfree(ds->err2);
     sfree(ds);
 }
 
 static void draw_clue_letter(drawing *dr, game_drawstate *ds,
                         const game_state *state, int x, int y)
 {
-	int wh = state->wh;
+	int wh = state->par.wh;
     int tx, ty, tw, th;
     char str[2];
 	
@@ -1368,20 +1773,20 @@ static void draw_clue_letter(drawing *dr, game_drawstate *ds,
 		ty = BORDER - GRIDEXTRA + 1;
 		clip(dr, tx, ty, tw, th);
 		draw_rect(dr, tx, ty, tw, th, COL_EDGE);
-		str[0] = (state->edges.top[x] >> 1) + 'A';
+		str[0] = (state->edges.top[x]) ? (char)log2(state->edges.top[x]) + 'A' : ' '; //FIX
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  (state->clues_completed[x]) ? COL_DONE : COL_GRID, str);
-		unclip(dr);
+		  (ds->err2[x]) ? COL_ERROR : state->clues_completed[x] ? COL_DONE : COL_GRID, str); 
+		unclip(dr); 
 		} else if(y == wh) {/* Bottom */
 		ty = BORDER + (wh+1)*TILE_SIZE + GRIDEXTRA + 1;
 		clip(dr, tx, ty, tw, th);
 		draw_rect(dr, tx, ty, tw, th, COL_EDGE);
-		str[0] = (state->edges.bottom[x] >> 1) + 'A';
+		str[0] = (state->edges.bottom[x]) ? ((char)log2(state->edges.bottom[x])) + 'A' : ' '; //FIX
 
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  (state->clues_completed[wh+x]) ? COL_DONE : COL_GRID, str);
+		  (ds->err2[wh+x]) ? COL_ERROR : state->clues_completed[wh+x] ? COL_DONE : COL_GRID, str);
 		unclip(dr);
 		}
 	}
@@ -1394,19 +1799,19 @@ static void draw_clue_letter(drawing *dr, game_drawstate *ds,
 		tx = BORDER - GRIDEXTRA +1 ;
 		clip(dr, tx, ty, tw, th);
 		draw_rect(dr, tx, ty, tw, th, COL_EDGE);
-		str[0] = (state->edges.left[y] >> 1) + 'A';
+		str[0] = (state->edges.left[y]) ? (char)log2(state->edges.left[y]) + 'A' : ' '; //FIX
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  (state->clues_completed[2*wh+y]) ? COL_DONE : COL_GRID, str);
+		ds->err2[2*wh+y] ? COL_ERROR : (state->clues_completed[2*wh+y]) ? COL_DONE : COL_GRID, str);
 		unclip(dr);
 		} else if(x == wh) {/* Right */
 		tx = BORDER + (wh+1)*TILE_SIZE + GRIDEXTRA + 1;
 		clip(dr, tx, ty, tw, th);
 		draw_rect(dr, tx, ty, tw, th, COL_EDGE);
-		str[0] = (state->edges.right[y] >> 1) + 'A';
+		str[0] = (state->edges.right[y]) ? (char)log2(state->edges.right[y]) + 'A' : ' '; //FIX
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_HCENTRE | ALIGN_VCENTRE,
-		  (state->clues_completed[3*wh+y]) ? COL_DONE : COL_GRID, str);
+		  (ds->err2[3*wh+y]) ? COL_ERROR : (ds->clues[3*wh+y] & DF_CLUE_DONE) ? COL_DONE : COL_GRID, str);
 		unclip(dr);
 		}
 	}
@@ -1415,9 +1820,9 @@ static void draw_clue_letter(drawing *dr, game_drawstate *ds,
 static void draw_user_letter(drawing *dr, game_drawstate *ds,
                         const game_state *state, int x, int y)
 {
-	int wh = state->wh;
+	int wh = state->par.wh;
     int tx, ty, tw, th;
-    char str[4];
+    char str[8];
 	
 	tx = BORDER + (x+1)*TILE_SIZE+1;
     ty = BORDER + (y+1)*TILE_SIZE+1;
@@ -1427,10 +1832,10 @@ static void draw_user_letter(drawing *dr, game_drawstate *ds,
 	clip(dr, tx, ty, tw, th);
 	
 	/* background needs erasing */
-    draw_rect(dr, tx, ty, tw, th, (ds->grid[y*wh+x] & MASK_CURSOR) ? COL_HIGHLIGHT : COL_BACKGROUND);
+    draw_rect(dr, tx, ty, tw, th, (ds->grid[y*wh+x] & DF_HIGHLIGHT) ? COL_HIGHLIGHT : COL_BACKGROUND);
 	
 	/* pencil-mode highlight */
-    if (ds->grid[y*wh+x] & MASK_PENCIL) {
+    if (ds->grid[y*wh+x] & DF_HIGHLIGHT_PENCIL) {
         int coords[6];
         coords[0] = tx;
         coords[1] = ty;
@@ -1443,30 +1848,105 @@ static void draw_user_letter(drawing *dr, game_drawstate *ds,
 	
 	if (state->grid[y*wh+x]) {
 		str[1] = '\0';
-		str[0] = (state->grid[y*wh+x] >> 1) + 'A';
+		str[0] = (char)log2(state->grid[y*wh+x]) + 'A';
 		draw_text(dr, tx + tw/2, ty + th/2,
 		  FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_VCENTRE | ALIGN_HCENTRE,
-		  COL_USER, str);
-    } else if(state->pencil[y*wh+x] & MASK_X) {
+		  (ds->err1[y*wh+x]) ? COL_ERROR : COL_USER, str);
+    } 
+	#if 0
+	else if(state->pencil[y*wh+x] & MASK_X) { // FIX THIS!!!!
 			draw_text(dr, tx + tw/2, ty + th/2,
-				FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_VCENTRE | ALIGN_HCENTRE,
+				FONT_VARIABLE, TILE_SIZE*2/3, ALIGN_VCENTRE | ALIGN_HCENTRE, 
 				COL_DONE, "X");
-	} else {
-		byte npencil = 0;
+	}
+	#endif
+	else {
+		int i, j, npencil;
+	int pl, pr, pt, pb;
+	float bestsize;
+	int pw, ph, minph, pbest, fontsize;
+
+        /* Count the pencil marks required. */
+
 		byte pencil = state->pencil[y*wh+x];
 		
-		int i;
-		for(i = 0; i < 3; i++)
-		if(pencil & (1 << i))
-		str[npencil++] = 'A' + i;
-		
-		str[npencil] = '\0';
-		
-		if (npencil)
-		draw_text(dr, tx + tw/8, ty + th/4,
-			FONT_VARIABLE, TILE_SIZE/4, ALIGN_HLEFT | ALIGN_VCENTRE,
-			COL_PENCIL, str);
+		for(i = npencil = 0; i < state->par.max; i++)
+			if(pencil & (1 << i))
+		npencil++;
+	if (npencil) {
+
+	    minph = 2;
+
+	    /*
+	     * Determine the bounding rectangle within which we're going
+	     * to put the pencil marks.
+	     */
+	    /* Start with the whole square */
+	    pl = tx + GRIDEXTRA;
+	    pr = pl + TILE_SIZE - GRIDEXTRA;
+	    pt = ty + GRIDEXTRA;
+	    pb = pt + TILE_SIZE - GRIDEXTRA;
+
+
+	    /*
+	     * We arrange our pencil marks in a grid layout, with
+	     * the number of rows and columns adjusted to allow the
+	     * maximum font size.
+	     *
+	     * So now we work out what the grid size ought to be.
+	     */
+	    bestsize = 0.0;
+	    pbest = 0;
+	    /* Minimum */
+	    for (pw = 3; pw < max(npencil,4); pw++) {
+		float fw, fh, fs;
+
+		ph = (npencil + pw - 1) / pw;
+		ph = max(ph, minph);
+		fw = (pr - pl) / (float)pw;
+		fh = (pb - pt) / (float)ph;
+		fs = min(fw, fh);
+		if (fs > bestsize) {
+		    bestsize = fs;
+		    pbest = pw;
+		}
+	    }
+	    assert(pbest > 0);
+	    pw = pbest;
+	    ph = (npencil + pw - 1) / pw;
+	    ph = max(ph, minph);
+
+	    /*
+	     * Now we've got our grid dimensions, work out the pixel
+	     * size of a grid element, and round it to the nearest
+	     * pixel. (We don't want rounding errors to make the
+	     * grid look uneven at low pixel sizes.)
+	     */
+	    fontsize = min((pr - pl) / pw, (pb - pt) / ph);
+
+	    /*
+	     * Centre the resulting figure in the square.
+	     */
+	    pl = tx + (TILE_SIZE - fontsize * pw) / 2;
+	    pt = ty + (TILE_SIZE - fontsize * ph) / 2;
+
+	    /*
+	     * Now actually draw the pencil marks.
+	     */
+	    for (i = j = 0; i < state->par.max; i++)
+		if(pencil & (1 << i)) {
+		    int dx = j % pw, dy = j / pw;
+
+		    str[1] = '\0';
+		    str[0] = i + 'A';
+		    draw_text(dr, pl + fontsize * (2*dx+1) / 2,
+			      pt + fontsize * (2*dy+1) / 2,
+			      FONT_VARIABLE, fontsize,
+			      ALIGN_VCENTRE | ALIGN_HCENTRE, COL_PENCIL, str);
+		    j++;
+		}
     }
+	}
 	
     unclip(dr);
 }
@@ -1476,7 +1956,7 @@ static void game_redraw(drawing *dr, game_drawstate *ds,
                         int dir, const game_ui *ui,
                         float animtime, float flashtime)
 {
-    int wh = state->wh;
+    int wh = state->par.wh;
     int x, y, i;
 
     if (!ds->started) {
@@ -1494,32 +1974,45 @@ static void game_redraw(drawing *dr, game_drawstate *ds,
 		ds->started = true;
 	}
 	
+	check_valid(state, ds->err1, ds->err2);
+	
 	for(i = 0; i < 4*wh; i++) {
-		if(ds->edges.top[i] == state->edges.top[i] &&
-			ds->clues_completed[i] == state->clues_completed[i])
-		continue;
+		long cell = state->edges.top[i];
 		
-		ds->edges.top[i] = state->edges.top[i];
-		ds->clues_completed[i] = state->clues_completed[i];
+		if(ds->err2[i])
+			cell |= DF_ERROR;
+		else if(state->clues_completed[i])
+			cell |= DF_CLUE_DONE;
+		
+		if(ds->clues[i] == cell)
+			continue;
+		
+		ds->clues[i] = cell;
+		//ds->clues_completed[i] = state->clues_completed[i];
+		
 		CLUEPOS(x, y, i, wh);
 		draw_clue_letter(dr, ds, state, x, y);
 	}
 	
     for (x = 0; x < wh; x++) {
 	for (y = 0; y < wh; y++) {
-        byte cell = state->grid[y*wh+x];
+        long cell = state->grid[y*wh+x];
 			
 		if (ui->hshow && x == ui->hx && y == ui->hy)
-			cell |= ui->hpencil ? MASK_PENCIL : MASK_CURSOR; /* store highlight information in a grid cell */
+			cell |= ui->hpencil ? DF_HIGHLIGHT_PENCIL : DF_HIGHLIGHT;
 		
 		if (flashtime > 0 && 
 			(flashtime <= FLASH_TIME/3 ||
 			 flashtime >= FLASH_TIME*2/3))
-            cell |= MASK_CURSOR;
+            cell |= DF_HIGHLIGHT;
+			
+		if(ds->err1[y*wh+x])
+			cell |= DF_ERROR;
 
 		if (ds->grid[y*wh+x] == cell &&
 			ds->pencil[y*wh+x] == state->pencil[y*wh+x])
 		continue;
+		
 
 		ds->grid[y*wh+x] = cell;
 		ds->pencil[y*wh+x] = state->pencil[y*wh+x];
@@ -1561,10 +2054,83 @@ static bool game_timing_state(const game_state *state, game_ui *ui)
 
 static void game_print_size(const game_params *params, float *x, float *y)
 {
+	#if 0
+    int pw, ph;
+
+    /*
+     * We use 9mm squares by default, like Solo.
+     */
+    game_compute_size(params, 900, &pw, &ph);
+    *x = pw / 100.0F;
+    *y = ph / 100.0F;
+	#endif
 }
 
 static void game_print(drawing *dr, const game_state *state, int tilesize)
 {
+	#if 0
+    int w = state->par.w;
+    int ink = print_mono_colour(dr, 0);
+    int i, x, y;
+
+    /* Ick: fake up `ds->tilesize' for macro expansion purposes */
+    game_drawstate ads, *ds = &ads;
+    game_set_size(dr, ds, NULL, tilesize);
+
+    /*
+     * Border.
+     */
+    print_line_width(dr, 3 * TILESIZE / 40);
+    draw_rect_outline(dr, BORDER, BORDER, w*TILESIZE, w*TILESIZE, ink);
+
+    /*
+     * Main grid.
+     */
+    for (x = 1; x < w; x++) {
+	print_line_width(dr, TILESIZE / 40);
+	draw_line(dr, BORDER+x*TILESIZE, BORDER,
+		  BORDER+x*TILESIZE, BORDER+w*TILESIZE, ink);
+    }
+    for (y = 1; y < w; y++) {
+	print_line_width(dr, TILESIZE / 40);
+	draw_line(dr, BORDER, BORDER+y*TILESIZE,
+		  BORDER+w*TILESIZE, BORDER+y*TILESIZE, ink);
+    }
+
+    /*
+     * Clues.
+     */
+    for (i = 0; i < 4*w; i++) {
+	char str[128];
+
+	if (!state->clues->clues[i])
+	    continue;
+
+	CLUEPOS(x, y, i, w);
+
+	sprintf (str, "%d", state->clues->clues[i]);
+
+	draw_text(dr, BORDER + x*TILESIZE + TILESIZE/2,
+		  BORDER + y*TILESIZE + TILESIZE/2,
+		  FONT_VARIABLE, TILESIZE/2,
+		  ALIGN_VCENTRE | ALIGN_HCENTRE, ink, str);
+    }
+
+    /*
+     * Numbers for the solution, if any.
+     */
+    for (y = 0; y < w; y++)
+	for (x = 0; x < w; x++)
+	    if (state->grid[y*w+x]) {
+		char str[2];
+		str[1] = '\0';
+		str[0] = state->grid[y*w+x] + '0';
+		draw_text(dr, BORDER + x*TILESIZE + TILESIZE/2,
+			  BORDER + y*TILESIZE + TILESIZE/2,
+			  FONT_VARIABLE, TILESIZE/2,
+			  ALIGN_VCENTRE | ALIGN_HCENTRE, ink, str);
+	    }
+	#endif
 }
 
 #ifdef COMBINED
@@ -1610,29 +2176,29 @@ const struct game thegame = {
     REQUIRE_RBUTTON,  /* flags */
 };
 
+ /* Solver fails on IDs from janko.at webpage:
+  * Janko Nr20 - 5l3://C///C//A/////C/B//A/B/B//A	**** Solver makes almost no progress on this ID ****
+  * Janko Nr48 - 7l4:/D/////D//B//A/D/B/A/B/A//C/A/A//////D/D/ 
+  * Janko Nr35 - 6l4:C//D///A//D//B/////B//B/D//D///A/B		
+  * Janko Nr251 - 5l4:/B/D/////B//D/C///D//B//A/C/
+  * Janko Nr480
+  * test Janko Nr100
+  */
+  
 #ifdef STANDALONE_SOLVER
-
-#include <time.h>
-
 int main(int argc, char **argv)
-{
-	bool random = false;
-	
-	time_t seed = time(NULL);
-		
-    game_params *params = NULL;
-    game_state *state = NULL;
-	
-    char *id = NULL, *desc = NULL;
+{		
+    game_params *params;
+    game_state *state;
+    char *id = NULL, *desc;
+	const char *err;
 
     while (--argc > 0) {
         char *p = *++argv;
         if (!strcmp(p, "-v"))
             solver_show_working = true;
 		else if (!strcmp(p, "-e"))
-            solver_show_elimination = true;
-		else if(!strcmp(p, "-g"))
-			random = true;
+            verbose = true;
 		else if (*p == '-') {
             printf("%s: unrecognised option `%s'\n", argv[0], p);
             return 1;
@@ -1641,40 +2207,37 @@ int main(int argc, char **argv)
         }
     }
 	
-	if (!id && !random) {
-        printf("usage: %s [-v | -e] <game_id> OR -g [<game_params>]\n", argv[0]);
+	if (!id) {
+        printf("usage: %s [-v | -e] <game_id>\n", argv[0]);
         return 1;
     }
 	
 	params = default_params();
 	decode_params(params, id);
 	
-	if(random) {
-		random_state *rs = random_new((void *)&seed, sizeof(time_t));
-		desc = new_game_desc(params, rs, NULL, 0);
-		
-		printf("game id: ");
-		printf("%d:%.*s\n",params->wh, 4*params->wh, desc);
-		return 0;
-	} else {
-		desc = strchr(id, ':');
-		if (!desc) {
-			printf("%s: game id expects a colon in it\n", argv[0]);
-			return 1;
-		}
-		
-		desc++;
-		const char *vd = validate_desc(params, desc);	
-		if(vd)
-		{
-			printf("%s\n", vd);
-			return 1;
-		}
+
+	desc = strchr(id, ':');
+	if (!desc) {
+		printf("%s: game id expects a colon in it\n", argv[0]);
+		return 1;
 	}
+	*desc++ = '\0';
+	#if 0 // FIX: BUG
+	err = validate_desc(params, desc);	
+	if(err)
+	{
+		fprintf(stderr, "%s: %s\n", argv[0], err);
+		return 1;
+	}
+	#endif
 	state = new_game(NULL, params, desc);
 	
 	struct solver_usage *usage = new_solver_usage(params);
+	/* FIX: copy grid clues into solver via solver_place */
 	solver(usage, &state->edges);
+	memcpy(state->grid, usage->grid, state->par.wh*state->par.wh);
+	
+	fputs(game_text_format(state), stdout);
 	
 	free_solver_usage(usage);
 	free_params(params);
